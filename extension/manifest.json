@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "PDF Tool",
+  "version": "1.0.0",
+  "description": "Preview, reorder, insert, and compress PDFs to a target file size — entirely in your browser.",
+  "action": {
+    "default_title": "Open PDF Tool",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": ["downloads"],
+  "web_accessible_resources": [
+    {
+      "resources": ["vendor/pdf.worker.min.js"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

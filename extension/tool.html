@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>PDF Tool</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="tool.css" />
+</head>
+<body>
+  <div class="app">
+    <header>
+      <div>
+        <h1>PDF Tool</h1>
+        <div class="subtitle" id="headerSubtitle">Upload a PDF to get started</div>
+        <div class="subtitle">Saves via your browser's downloads folder</div>
+      </div>
+      <div class="header-actions">
+        <button class="ghost-btn hidden" id="changeFileBtn" type="button">Change file</button>
+      </div>
+    </header>
+
+    <div class="uploader" id="uploader">
+      <div class="card">
+        <label class="drop" id="drop" for="file">
+          <div style="font-size:42px;margin-bottom:8px">📄</div>
+          <div>Drop a PDF here or <strong>browse</strong></div>
+          <div style="color:var(--muted);font-size:12px;margin-top:8px">Runs entirely in your browser</div>
+          <input type="file" id="file" accept="application/pdf" />
+        </label>
+      </div>
+    </div>
+
+    <div class="viewer hidden" id="viewer">
+      <aside class="thumbs">
+        <div class="thumbs-header">
+          <span id="pageCount">0 pages</span>
+          <button id="resetBtn" type="button" disabled>Reset</button>
+        </div>
+        <div id="thumbs"></div>
+      </aside>
+      <main class="preview" id="preview">
+        <div class="placeholder">Loading preview…</div>
+      </main>
+      <aside class="controls">
+        <h2>Output</h2>
+        <div class="file-info" id="fileInfo"></div>
+        <div class="edit-status" id="editStatus"></div>
+
+        <button class="secondary" id="downloadAsIs" type="button">Save as-is</button>
+
+        <label for="size">Target size</label>
+        <div class="row">
+          <input type="number" id="size" min="1" step="1" value="500" />
+          <select id="unit">
+            <option value="KB" selected>KB</option>
+            <option value="MB">MB</option>
+          </select>
+        </div>
+
+        <div class="mode-hint" id="modeHint">Compression runs entirely in your browser — the file is never uploaded.</div>
+
+        <button class="primary" id="submit" type="button">Compress</button>
+        <div class="progress hidden" id="progress">
+          <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+          <div class="progress-label" id="progressLabel">Preparing…</div>
+        </div>
+        <div class="result" id="result"></div>
+      </aside>
+    </div>
+  </div>
+
+  <input type="file" id="insertFile" accept="application/pdf,image/jpeg,image/png" style="display:none" />
+
+  <script src="vendor/pdf.min.js"></script>
+  <script src="vendor/pdf-lib.min.js"></script>
+  <script src="tool.js"></script>
+</body>
+</html>
