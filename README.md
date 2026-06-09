@@ -6,6 +6,7 @@ A small Flask + JavaScript web app for previewing, organizing, and compressing P
 
 - **Preview** — uploaded PDF renders thumbnails on the left and a large preview of the active page in the center (PDF.js, fully client-side).
 - **Organize pages** — drag thumbnails to reorder, hover-and-click `×` to delete. A header strip shows the page count and a **Reset** link.
+- **Insert pages** — hover between any two thumbnails (or at the top/bottom) and click the inline insert bar to splice in another **PDF, JPG, or PNG**. Images are wrapped in a single-page PDF (sized to match the original document's first page, or US Letter when there is none) and fit inside it preserving aspect ratio.
 - **Save as-is** — writes the current (possibly reorganized) PDF without recompression. If untouched, the original bytes are written; if edited, [pdf-lib](https://pdf-lib.js.org/) rebuilds it losslessly in the browser first.
 - **Compress to a target size** — pick a size in KB or MB. The app tries a series of DPI/JPEG-quality presets (200 dpi / q=85 down to 36 dpi / q=25) until the output fits at or below the target.
 - **Two compression modes**

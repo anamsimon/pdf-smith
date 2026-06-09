@@ -457,8 +457,8 @@
     </div>
   </div>
 
-  <!-- Hidden file input used by "Insert PDF here" bars -->
-  <input type="file" id="insertFile" accept="application/pdf" style="display:none" />
+  <!-- Hidden file input used by the "Insert here" bars -->
+  <input type="file" id="insertFile" accept="application/pdf,image/jpeg,image/png" style="display:none" />
 
   <!-- PDF.js -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
@@ -634,10 +634,53 @@
 
     async function loadDoc(file) {
       const buf = await file.arrayBuffer();
-      const bytes = new Uint8Array(buf);
+      return loadDocFromBytes(new Uint8Array(buf), file.name);
+    }
+
+    async function loadDocFromBytes(bytes, name) {
       // getDocument owns the buffer it's given — pass a clone so we can keep `bytes` for pdf-lib.
       const pdf = await pdfjsLib.getDocument({ data: bytes.slice() }).promise;
-      return { pdf, bytes, name: file.name };
+      return { pdf, bytes, name };
+    }
+
+    // Wrap an inserted image in a single-page PDF so it flows through the
+    // existing PDF-only insert/thumbnail/compress paths unchanged.
+    async function imageFileToPdfBytes(file) {
+      if (typeof PDFLib === 'undefined') throw new Error('pdf-lib failed to load');
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const lower = file.name.toLowerCase();
+      const isPng = lower.endsWith('.png') || file.type === 'image/png';
+      const isJpg = lower.endsWith('.jpg') || lower.endsWith('.jpeg') || file.type === 'image/jpeg';
+      if (!isPng && !isJpg) throw new Error('Unsupported image type');
+
+      const newDoc = await PDFLib.PDFDocument.create();
+      const img = isPng ? await newDoc.embedPng(bytes) : await newDoc.embedJpg(bytes);
+
+      // Match the first original page's size when available so inserts feel
+      // consistent; otherwise fall back to Letter, oriented to the image.
+      let pageW, pageH;
+      if (docs[0] && docs[0].pdf.numPages > 0) {
+        const p = await docs[0].pdf.getPage(1);
+        const vp = p.getViewport({ scale: 1 });
+        pageW = vp.width;
+        pageH = vp.height;
+      } else {
+        const landscape = img.width > img.height;
+        pageW = landscape ? 792 : 612;
+        pageH = landscape ? 612 : 792;
+      }
+
+      const scale = Math.min(pageW / img.width, pageH / img.height);
+      const drawW = img.width * scale;
+      const drawH = img.height * scale;
+      const page = newDoc.addPage([pageW, pageH]);
+      page.drawImage(img, {
+        x: (pageW - drawW) / 2,
+        y: (pageH - drawH) / 2,
+        width: drawW,
+        height: drawH,
+      });
+      return await newDoc.save({ useObjectStreams: true });
     }
 
     // Render thumb canvases for every page of docs[docIdx], cache them, but do not append to DOM.
@@ -744,10 +787,10 @@
     function makeInsertBar(insertIndex) {
       const bar = document.createElement('div');
       bar.className = 'insert-bar';
-      bar.title = 'Insert PDF here';
+      bar.title = 'Insert PDF or image here';
       const chip = document.createElement('span');
       chip.className = 'chip';
-      chip.textContent = '+ Insert PDF';
+      chip.textContent = '+ Insert PDF / image';
       bar.appendChild(chip);
       bar.addEventListener('click', () => triggerInsert(insertIndex));
       return bar;
@@ -816,8 +859,12 @@
     insertFileInput.addEventListener('change', async () => {
       const file = insertFileInput.files[0];
       if (!file) return;
-      if (!file.name.toLowerCase().endsWith('.pdf')) {
-        alert('Please choose a PDF file.');
+      const lower = file.name.toLowerCase();
+      const isPdf = lower.endsWith('.pdf');
+      const isImg = /\.(jpe?g|png)$/.test(lower)
+        || file.type === 'image/jpeg' || file.type === 'image/png';
+      if (!isPdf && !isImg) {
+        alert('Please choose a PDF, JPG, or PNG file.');
         return;
       }
       if (pendingInsertIndex == null) return;
@@ -825,7 +872,13 @@
       pendingInsertIndex = null;
 
       try {
-        const entry = await loadDoc(file);
+        let entry;
+        if (isPdf) {
+          entry = await loadDoc(file);
+        } else {
+          const pdfBytes = await imageFileToPdfBytes(file);
+          entry = await loadDocFromBytes(pdfBytes, file.name);
+        }
         const docIdx = docs.length;
         docs.push(entry);
         await renderDocThumbnails(docIdx);
