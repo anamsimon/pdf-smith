@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>PDF Tool</title>
+  <title>PDF Smith</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="stylesheet" href="tool.css" />
 </head>
@@ -10,11 +10,12 @@
   <div class="app">
     <header>
       <div>
-        <h1>PDF Tool</h1>
+        <h1>PDF Smith</h1>
         <div class="subtitle" id="headerSubtitle">Upload a PDF to get started</div>
         <div class="subtitle">Saves via your browser's downloads folder</div>
       </div>
       <div class="header-actions">
+        <script type="text/javascript" src="https://cdnjs.buymeacoffee.com/1.0.0/button.prod.min.js" data-name="bmc-button" data-slug="anamsimon" data-color="#FFDD00" data-emoji="☕" data-font="Poppins" data-text="Buy me a coffee" data-outline-color="#000000" data-font-color="#000000" data-coffee-color="#ffffff"></script>
         <button class="ghost-btn hidden" id="changeFileBtn" type="button">Close file</button>
       </div>
     </header>
@@ -38,9 +39,21 @@
         </div>
         <div id="thumbs"></div>
       </aside>
-      <main class="preview" id="preview">
-        <div class="placeholder">Loading preview…</div>
-      </main>
+      <div class="preview-col">
+        <main class="preview" id="preview">
+          <div class="placeholder">Loading preview…</div>
+        </main>
+        <div class="zoom-bar" id="zoomBar">
+          <button class="zoom-btn" id="zoomOutBtn" type="button" title="Zoom out">−</button>
+          <span id="zoomLabel">100%</span>
+          <button class="zoom-btn" id="zoomInBtn" type="button" title="Zoom in">+</button>
+          <span class="zoom-sep"></span>
+          <button class="zoom-btn" id="textModeBtn" type="button" title="Add text to page">T</button>
+          <span class="zoom-sep"></span>
+          <button class="zoom-btn" id="undoBtn" type="button" title="Undo (Ctrl+Z)" disabled>↶</button>
+          <button class="zoom-btn" id="redoBtn" type="button" title="Redo (Ctrl+Y)" disabled>↷</button>
+        </div>
+      </div>
       <aside class="controls">
         <h2>Output</h2>
         <div class="file-info" id="fileInfo"></div>
@@ -70,6 +83,30 @@
   </div>
 
   <input type="file" id="insertFile" accept="application/pdf,image/jpeg,image/png" multiple style="display:none" />
+
+  <div class="text-panel hidden" id="textPanel">
+    <div class="text-panel-head">
+      <span>Add Text</span>
+      <button class="text-panel-close" id="tpClose" type="button">✕</button>
+    </div>
+    <div class="text-panel-format">
+      <select id="tpFont">
+        <option value="Helvetica">Helvetica</option>
+        <option value="Times-Roman">Times Roman</option>
+        <option value="Courier">Courier</option>
+      </select>
+      <input type="number" id="tpSize" value="16" min="4" max="400" />
+      <button type="button" id="tpBold" class="fmt-btn" title="Bold"><b>B</b></button>
+      <button type="button" id="tpItalic" class="fmt-btn" title="Italic"><i>I</i></button>
+      <input type="color" id="tpColor" value="#000000" />
+    </div>
+    <textarea id="tpText" rows="3" placeholder="Type text here…"></textarea>
+    <div class="text-panel-hint" id="tpHint">Click on a page to place the text</div>
+    <div class="text-panel-actions">
+      <button type="button" id="tpAdd" class="primary" disabled>Add</button>
+      <button type="button" id="tpCancel" class="secondary">Cancel</button>
+    </div>
+  </div>
 
   <script src="vendor/pdf.min.js"></script>
   <script src="vendor/pdf-lib.min.js"></script>

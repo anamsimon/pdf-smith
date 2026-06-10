@@ -1,10 +1,10 @@
 {
   "manifest_version": 3,
-  "name": "PDF Tool",
+  "name": "PDF Smith",
   "version": "1.0.0",
   "description": "Preview, reorder, insert, and compress PDFs to a target file size — entirely in your browser.",
   "action": {
-    "default_title": "Open PDF Tool",
+    "default_title": "Open PDF Smith",
     "default_icon": {
       "16": "icons/icon-16.png",
       "32": "icons/icon-32.png",
