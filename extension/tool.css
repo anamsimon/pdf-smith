@@ -47,6 +47,23 @@ header .subtitle { color: var(--muted); font-size: 12px; margin-top: 2px; }
   cursor: pointer;
 }
 .ghost-btn:hover { border-color: var(--accent); color: var(--accent); }
+.bmc-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  background: #FFDD00;
+  color: #000;
+  border: 1px solid #000;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  text-decoration: none;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+.bmc-btn:hover { opacity: 0.85; }
 
 .uploader {
   display: flex;
