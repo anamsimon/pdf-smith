@@ -29,7 +29,8 @@ const refKey = (r) => `${r.doc}:${r.page}`;
 let pendingInsertIndex = null;
 
 let currentFile = null;
-let renderTask = null;
+let previewRenderObserver = null;
+let scrollSyncTimer = null;
 
 const fmt = (b) => {
   if (b < 1024) return b + ' B';
@@ -38,7 +39,7 @@ const fmt = (b) => {
 };
 
 fileInput.addEventListener('change', () => {
-  if (fileInput.files[0]) handleFile(fileInput.files[0]);
+  if (fileInput.files.length) handleFiles(Array.from(fileInput.files));
 });
 ['dragenter','dragover'].forEach(ev => drop.addEventListener(ev, e => {
   e.preventDefault(); drop.classList.add('drag');
@@ -47,10 +48,11 @@ fileInput.addEventListener('change', () => {
   e.preventDefault(); drop.classList.remove('drag');
 }));
 drop.addEventListener('drop', e => {
-  if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+  if (e.dataTransfer.files.length) handleFiles(Array.from(e.dataTransfer.files));
 });
 
 changeFileBtn.addEventListener('click', () => {
+  if (previewRenderObserver) { previewRenderObserver.disconnect(); previewRenderObserver = null; }
   currentFile = null;
   docs.length = 0;
   pageOrder = [];
@@ -71,16 +73,18 @@ changeFileBtn.addEventListener('click', () => {
 
 resetBtn.addEventListener('click', () => {
   if (!docs[0]) return;
+  const hadRotations = pageOrder.some(r => (r.rotation || 0) !== 0);
   docs.length = 1;
   for (const k of Array.from(thumbCache.keys())) {
     if (!k.startsWith('0:')) thumbCache.delete(k);
   }
-  pageOrder = Array.from({ length: originalPageCount }, (_, i) => ({ doc: 0, page: i + 1 }));
+  pageOrder = Array.from({ length: originalPageCount }, (_, i) => ({ doc: 0, page: i + 1, rotation: 0 }));
   if (!currentRef || currentRef.doc !== 0 || currentRef.page > originalPageCount) {
     currentRef = pageOrder[0];
   }
+  if (hadRotations) renderDocThumbnails(0);
   rebuildThumbList();
-  renderMainPage(currentRef);
+  buildContinuousPreview(currentRef);
   updateEditStatus();
 });
 
@@ -90,7 +94,7 @@ function isOrderChanged() {
   if (pageOrder.length !== originalPageCount) return true;
   for (let i = 0; i < pageOrder.length; i++) {
     const r = pageOrder[i];
-    if (r.doc !== 0 || r.page !== i + 1) return true;
+    if (r.doc !== 0 || r.page !== i + 1 || (r.rotation || 0) !== 0) return true;
   }
   return false;
 }
@@ -114,35 +118,80 @@ function updateEditStatus() {
   }
 }
 
-async function handleFile(file) {
-  if (!file.name.toLowerCase().endsWith('.pdf')) {
-    alert('Please choose a PDF file.');
-    return;
+async function handleFiles(files) {
+  const valid = [];
+  for (const file of files) {
+    const lower = file.name.toLowerCase();
+    const isPdf = lower.endsWith('.pdf');
+    const isImg = /\.(jpe?g|png)$/.test(lower) || file.type === 'image/jpeg' || file.type === 'image/png';
+    if (!isPdf && !isImg) {
+      alert(`Skipping "${file.name}": only PDF, JPG, or PNG files are supported.`);
+      continue;
+    }
+    valid.push({ file, isPdf });
   }
-  currentFile = file;
-  fileInfoEl.textContent = `${file.name} · ${fmt(file.size)}`;
-  headerSubtitle.textContent = file.name;
+  if (!valid.length) return;
+
+  currentFile = valid[0].file;
+  headerSubtitle.textContent = valid.length === 1 ? valid[0].file.name : `${valid.length} files`;
+  fileInfoEl.textContent = valid.length === 1
+    ? `${valid[0].file.name} · ${fmt(valid[0].file.size)}`
+    : `${valid.length} files · ${fmt(valid.reduce((s, e) => s + e.file.size, 0))} total`;
 
   uploader.classList.add('hidden');
   viewer.classList.remove('hidden');
   changeFileBtn.classList.remove('hidden');
 
+  // Load first file as the base document
   try {
-    const docEntry = await loadDoc(file);
+    let firstEntry;
+    if (valid[0].isPdf) {
+      firstEntry = await loadDoc(valid[0].file);
+    } else {
+      const pdfBytes = await imageFileToPdfBytes(valid[0].file);
+      firstEntry = await loadDocFromBytes(pdfBytes, valid[0].file.name);
+    }
     docs.length = 0;
-    docs.push(docEntry);
+    docs.push(firstEntry);
   } catch (err) {
-    previewEl.innerHTML = `<div class="placeholder" style="color:var(--err)">Failed to load PDF: ${err.message}</div>`;
+    previewEl.innerHTML = `<div class="placeholder" style="color:var(--err)">Failed to load file: ${err.message}</div>`;
     return;
   }
 
   originalPageCount = docs[0].pdf.numPages;
-  pageOrder = Array.from({ length: originalPageCount }, (_, i) => ({ doc: 0, page: i + 1 }));
+  pageOrder = Array.from({ length: originalPageCount }, (_, i) => ({ doc: 0, page: i + 1, rotation: 0 }));
   await renderDocThumbnails(0);
   rebuildThumbList();
   currentRef = pageOrder[0];
-  await renderMainPage(currentRef);
+  buildContinuousPreview(currentRef);
   updateEditStatus();
+
+  // Append remaining files
+  for (let i = 1; i < valid.length; i++) {
+    const { file, isPdf } = valid[i];
+    try {
+      let entry;
+      if (isPdf) {
+        entry = await loadDoc(file);
+      } else {
+        const pdfBytes = await imageFileToPdfBytes(file);
+        entry = await loadDocFromBytes(pdfBytes, file.name);
+      }
+      const docIdx = docs.length;
+      docs.push(entry);
+      await renderDocThumbnails(docIdx);
+      const newRefs = Array.from({ length: entry.pdf.numPages }, (_, j) => ({ doc: docIdx, page: j + 1, rotation: 0 }));
+      pageOrder.push(...newRefs);
+    } catch (err) {
+      alert(`Failed to load "${file.name}": ${err.message}`);
+    }
+  }
+
+  if (valid.length > 1) {
+    rebuildThumbList();
+    buildContinuousPreview(currentRef);
+    updateEditStatus();
+  }
 }
 
 async function loadDoc(file) {
@@ -236,6 +285,17 @@ function buildThumbElement(ref) {
     wrap.appendChild(badge);
   }
 
+  const rot = document.createElement('button');
+  rot.type = 'button';
+  rot.className = 'rot';
+  rot.title = 'Rotate 90°';
+  rot.textContent = '↻';
+  rot.addEventListener('click', (e) => {
+    e.stopPropagation();
+    rotatePageByKey(wrap.dataset.ref);
+  });
+  wrap.appendChild(rot);
+
   const del = document.createElement('button');
   del.type = 'button';
   del.className = 'del';
@@ -290,6 +350,44 @@ function clearDropIndicators() {
     .forEach(el => el.classList.remove('drop-above', 'drop-below'));
 }
 
+function rotatePageByKey(key) {
+  const entries = pageOrder.filter(r => refKey(r) === key);
+  if (!entries.length) return;
+  const newRot = ((entries[0].rotation || 0) + 90) % 360;
+  entries.forEach(r => { r.rotation = newRot; });
+  const wrap = thumbCache.get(key);
+  if (wrap) {
+    const [docIdx, pageNum] = key.split(':').map(Number);
+    rerenderThumbElement(wrap, docIdx, pageNum, newRot);
+  }
+  // Re-render all preview slots that show this source page
+  previewEl.querySelectorAll('.preview-page').forEach(slot => {
+    const idx = parseInt(slot.dataset.idx);
+    if (pageOrder[idx] && refKey(pageOrder[idx]) === key) {
+      delete slot.dataset.rendered;
+      renderPageIntoSlot(slot, idx);
+    }
+  });
+  updateEditStatus();
+}
+
+async function rerenderThumbElement(wrap, docIdx, pageNum, rotation) {
+  if (!docs[docIdx]) return;
+  try {
+    const page = await docs[docIdx].pdf.getPage(pageNum);
+    const targetWidth = 170;
+    const baseViewport = page.getViewport({ scale: 1, rotation });
+    const scale = targetWidth / baseViewport.width;
+    const viewport = page.getViewport({ scale, rotation });
+    const canvas = wrap.querySelector('canvas');
+    canvas.width = viewport.width;
+    canvas.height = viewport.height;
+    await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+  } catch (err) {
+    console.error('thumbnail re-render failed', err);
+  }
+}
+
 function makeInsertBar(insertIndex) {
   const bar = document.createElement('div');
   bar.className = 'insert-bar';
@@ -325,9 +423,9 @@ function deletePageAt(key) {
   const removed = pageOrder.splice(idx, 1)[0];
   if (currentRef && refKey(removed) === refKey(currentRef)) {
     currentRef = pageOrder[Math.min(idx, pageOrder.length - 1)];
-    renderMainPage(currentRef);
   }
   rebuildThumbList();
+  buildContinuousPreview(currentRef);
   updateEditStatus();
 }
 
@@ -340,19 +438,18 @@ function movePageByKey(draggedKey, targetKey, insertAbove) {
   if (!insertAbove) to += 1;
   pageOrder.splice(to, 0, ref);
   rebuildThumbList();
+  buildContinuousPreview(currentRef);
   updateEditStatus();
 }
 
-async function selectPage(ref) {
-  if (currentRef && refKey(ref) === refKey(currentRef)) return;
+function selectPage(ref) {
   currentRef = ref;
-  const key = refKey(ref);
-  document.querySelectorAll('.thumb').forEach(el => {
-    el.classList.toggle('active', el.dataset.ref === key);
-  });
-  const active = document.querySelector('.thumb.active');
-  if (active) active.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-  await renderMainPage(ref);
+  updateThumbActive();
+  const idx = pageOrder.findIndex(r => r === ref || refKey(r) === refKey(ref));
+  if (idx >= 0) {
+    const slot = previewEl.querySelectorAll('.preview-page')[idx];
+    if (slot) slot.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
 }
 
 function triggerInsert(insertIndex) {
@@ -362,83 +459,138 @@ function triggerInsert(insertIndex) {
 }
 
 insertFileInput.addEventListener('change', async () => {
-  const file = insertFileInput.files[0];
-  if (!file) return;
-  const lower = file.name.toLowerCase();
-  const isPdf = lower.endsWith('.pdf');
-  const isImg = /\.(jpe?g|png)$/.test(lower)
-    || file.type === 'image/jpeg' || file.type === 'image/png';
-  if (!isPdf && !isImg) {
-    alert('Please choose a PDF, JPG, or PNG file.');
-    return;
-  }
+  const files = Array.from(insertFileInput.files);
+  if (!files.length) return;
   if (pendingInsertIndex == null) return;
-  const insertAt = pendingInsertIndex;
+  let insertAt = pendingInsertIndex;
   pendingInsertIndex = null;
 
-  try {
-    let entry;
-    if (isPdf) {
-      entry = await loadDoc(file);
-    } else {
-      const pdfBytes = await imageFileToPdfBytes(file);
-      entry = await loadDocFromBytes(pdfBytes, file.name);
+  let firstNewRef = null;
+  for (const file of files) {
+    const lower = file.name.toLowerCase();
+    const isPdf = lower.endsWith('.pdf');
+    const isImg = /\.(jpe?g|png)$/.test(lower)
+      || file.type === 'image/jpeg' || file.type === 'image/png';
+    if (!isPdf && !isImg) {
+      alert(`Skipping "${file.name}": only PDF, JPG, or PNG files are supported.`);
+      continue;
     }
-    const docIdx = docs.length;
-    docs.push(entry);
-    await renderDocThumbnails(docIdx);
-    const newRefs = Array.from({ length: entry.pdf.numPages }, (_, i) => ({ doc: docIdx, page: i + 1 }));
-    pageOrder.splice(insertAt, 0, ...newRefs);
-    rebuildThumbList();
-    updateEditStatus();
-    if (newRefs.length) {
-      await selectPage(newRefs[0]);
+    try {
+      let entry;
+      if (isPdf) {
+        entry = await loadDoc(file);
+      } else {
+        const pdfBytes = await imageFileToPdfBytes(file);
+        entry = await loadDocFromBytes(pdfBytes, file.name);
+      }
+      const docIdx = docs.length;
+      docs.push(entry);
+      await renderDocThumbnails(docIdx);
+      const newRefs = Array.from({ length: entry.pdf.numPages }, (_, i) => ({ doc: docIdx, page: i + 1, rotation: 0 }));
+      pageOrder.splice(insertAt, 0, ...newRefs);
+      insertAt += newRefs.length;
+      if (!firstNewRef && newRefs.length) firstNewRef = newRefs[0];
+    } catch (err) {
+      alert(`Failed to load "${file.name}": ${err.message}`);
     }
-  } catch (err) {
-    alert(`Failed to load inserted PDF: ${err.message}`);
   }
+
+  rebuildThumbList();
+  buildContinuousPreview(firstNewRef || currentRef);
+  updateEditStatus();
+  if (firstNewRef) selectPage(firstNewRef);
 });
 
-async function renderMainPage(ref) {
-  if (renderTask) {
-    try { renderTask.cancel(); } catch (e) {}
-    renderTask = null;
-  }
-  if (!ref || !docs[ref.doc]) return;
-  const page = await docs[ref.doc].pdf.getPage(ref.page);
-  const containerWidth = previewEl.clientWidth - 48;
-  const containerHeight = previewEl.clientHeight - 48;
-  const baseViewport = page.getViewport({ scale: 1 });
-  const scale = Math.min(
-    containerWidth / baseViewport.width,
-    containerHeight / baseViewport.height,
-    2.5
-  );
-  const viewport = page.getViewport({ scale: Math.max(scale, 0.5) });
-
-  const canvas = document.createElement('canvas');
-  canvas.width = viewport.width;
-  canvas.height = viewport.height;
-  const ctx = canvas.getContext('2d');
-
+function buildContinuousPreview(scrollToRef) {
+  if (previewRenderObserver) { previewRenderObserver.disconnect(); previewRenderObserver = null; }
   previewEl.innerHTML = '';
-  previewEl.appendChild(canvas);
+  if (!pageOrder.length) return;
 
-  renderTask = page.render({ canvasContext: ctx, viewport });
-  try {
-    await renderTask.promise;
-  } catch (err) {
-    if (err && err.name !== 'RenderingCancelledException') console.error(err);
-  } finally {
-    renderTask = null;
+  for (let i = 0; i < pageOrder.length; i++) {
+    const slot = document.createElement('div');
+    slot.className = 'preview-page';
+    slot.dataset.idx = String(i);
+    slot.appendChild(document.createElement('canvas'));
+    previewEl.appendChild(slot);
+  }
+
+  previewRenderObserver = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (entry.isIntersecting && !entry.target.dataset.rendered) {
+        entry.target.dataset.rendered = '1';
+        renderPageIntoSlot(entry.target, parseInt(entry.target.dataset.idx));
+      }
+    }
+  }, { root: previewEl, rootMargin: '400px 0px 400px 0px' });
+
+  previewEl.querySelectorAll('.preview-page').forEach(slot => previewRenderObserver.observe(slot));
+
+  if (scrollToRef) {
+    const idx = pageOrder.findIndex(r => r === scrollToRef || refKey(r) === refKey(scrollToRef));
+    if (idx >= 0) {
+      const slots = previewEl.querySelectorAll('.preview-page');
+      if (slots[idx]) slots[idx].scrollIntoView({ block: 'start' });
+    }
   }
 }
+
+async function renderPageIntoSlot(slot, idx) {
+  const ref = pageOrder[idx];
+  if (!ref || !docs[ref.doc]) return;
+  const rotation = ref.rotation || 0;
+  try {
+    const page = await docs[ref.doc].pdf.getPage(ref.page);
+    const containerWidth = previewEl.clientWidth - 48;
+    const baseViewport = page.getViewport({ scale: 1, rotation });
+    const scale = Math.min(containerWidth / baseViewport.width, 2.5);
+    const viewport = page.getViewport({ scale: Math.max(scale, 0.5), rotation });
+    const canvas = slot.querySelector('canvas');
+    canvas.width = viewport.width;
+    canvas.height = viewport.height;
+    await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+  } catch (err) {
+    if (err?.name !== 'RenderingCancelledException') console.error('page render failed', err);
+  }
+}
+
+function syncActivePageFromScroll() {
+  const slots = previewEl.querySelectorAll('.preview-page');
+  if (!slots.length) return;
+  const scrollMid = previewEl.scrollTop + previewEl.clientHeight / 2;
+  let best = null, bestDist = Infinity;
+  for (const slot of slots) {
+    const dist = Math.abs((slot.offsetTop + slot.offsetHeight / 2) - scrollMid);
+    if (dist < bestDist) { bestDist = dist; best = slot; }
+  }
+  if (!best) return;
+  const idx = parseInt(best.dataset.idx);
+  const ref = pageOrder[idx];
+  if (ref && (!currentRef || refKey(ref) !== refKey(currentRef))) {
+    currentRef = ref;
+    updateThumbActive();
+  }
+}
+
+function updateThumbActive() {
+  if (!currentRef) return;
+  const key = refKey(currentRef);
+  document.querySelectorAll('.thumb').forEach(el => {
+    el.classList.toggle('active', el.dataset.ref === key);
+  });
+  const active = document.querySelector('.thumb.active');
+  if (active) active.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+
+previewEl.addEventListener('scroll', () => {
+  clearTimeout(scrollSyncTimer);
+  scrollSyncTimer = setTimeout(syncActivePageFromScroll, 60);
+}, { passive: true });
 
 let resizeTimer;
 window.addEventListener('resize', () => {
   if (!currentRef) return;
   clearTimeout(resizeTimer);
-  resizeTimer = setTimeout(() => renderMainPage(currentRef), 150);
+  resizeTimer = setTimeout(() => buildContinuousPreview(currentRef), 200);
 });
 
 const PRESETS = [
@@ -484,9 +636,10 @@ async function buildPdfAtPreset(preset, onPageProgress) {
 
   for (let i = 0; i < numPages; i++) {
     const ref = order[i];
+    const rotation = ref.rotation || 0;
     const page = await docs[ref.doc].pdf.getPage(ref.page);
-    const baseViewport = page.getViewport({ scale: 1 });
-    const viewport = page.getViewport({ scale });
+    const baseViewport = page.getViewport({ scale: 1, rotation });
+    const viewport = page.getViewport({ scale, rotation });
 
     const canvas = document.createElement('canvas');
     canvas.width = Math.floor(viewport.width);
@@ -562,7 +715,15 @@ async function buildReorganizedPdfBytes() {
   for (const g of groups) {
     const src = await getSrcDoc(g.docIdx);
     const copied = await newDoc.copyPages(src, g.indices);
-    copied.forEach((page, k) => { finalPages[g.outPositions[k]] = page; });
+    copied.forEach((page, k) => {
+      const outIdx = g.outPositions[k];
+      const addRotation = pageOrder[outIdx].rotation || 0;
+      if (addRotation !== 0) {
+        const current = page.getRotation().angle;
+        page.setRotation(PDFLib.degrees((current + addRotation) % 360));
+      }
+      finalPages[outIdx] = page;
+    });
   }
   finalPages.forEach(p => newDoc.addPage(p));
   return await newDoc.save({ useObjectStreams: true });
@@ -695,7 +856,7 @@ submit.addEventListener('click', async () => {
     result.innerHTML = `<strong style="color:var(--err)">Error:</strong> ${escapeHtml(err.message)}`;
   } finally {
     submit.disabled = false;
-    submit.textContent = 'Compress';
+    submit.textContent = 'Compress & Download';
     hideProgress();
   }
 });
