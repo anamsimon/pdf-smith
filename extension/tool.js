@@ -2036,7 +2036,68 @@ async function saveAsIs() {
   }
 }
 
+// ---- Bug reports ---------------------------------------------------------------
+// Opens the user's mail app with a pre-filled report. Only environment details
+// are included — never file names or document contents.
+const BUG_REPORT_EMAIL = 'anam.simon@gmail.com';
+let skipUnloadPrompt = false;
+
+async function bugReportEnvironment() {
+  let version = '?';
+  try { version = chrome.runtime.getManifest().version; } catch {}
+  let browser = navigator.userAgent, os = navigator.platform || 'Unknown';
+  try {
+    const uad = navigator.userAgentData;
+    if (uad) {
+      const hi = await uad.getHighEntropyValues(['fullVersionList', 'platformVersion']);
+      const brand = (hi.fullVersionList || uad.brands || [])
+        .find(b => /Chrome|Edge|Opera|Brave/i.test(b.brand) && !/Chromium/i.test(b.brand))
+        || (hi.fullVersionList || [])[0];
+      if (brand) browser = `${brand.brand} ${brand.version}`;
+      os = `${uad.platform} ${hi.platformVersion || ''}`.trim();
+    }
+  } catch {}
+  const editorOpen = !viewer.classList.contains('hidden');
+  return [
+    `PDF Smith version: ${version}`,
+    `Browser: ${browser}`,
+    `Operating system: ${os}`,
+    `Screen: ${editorOpen ? 'Editor' : 'Start screen'}${editorOpen ? ` · ${pageOrder.length} page(s) · export mode: ${exportMode()}` : ''}`,
+  ].join('\n');
+}
+
+async function openBugReport() {
+  const env = await bugReportEnvironment();
+  const body = [
+    'What happened?',
+    '',
+    '',
+    'What did you expect to happen?',
+    '',
+    '',
+    'Steps to reproduce:',
+    '1. ',
+    '2. ',
+    '',
+    '---',
+    env,
+    '',
+    '(Please don\'t attach private documents. If the problem only happens with one file, describe it, e.g. "scanned PDF, 40 pages".)',
+  ].join('\n');
+  const url = `mailto:${BUG_REPORT_EMAIL}?subject=${encodeURIComponent('PDF Smith bug report')}&body=${encodeURIComponent(body)}`;
+  // A mailto: navigation fires beforeunload; don't warn about unsaved edits for it.
+  skipUnloadPrompt = true;
+  window.location.href = url;
+  setTimeout(() => { skipUnloadPrompt = false; }, 1000);
+}
+
+document.querySelectorAll('[data-bug-report]').forEach(a => a.addEventListener('click', (e) => {
+  e.preventDefault();
+  openBugReport();
+}));
+
 window.addEventListener('beforeunload', (e) => {
+  if (skipUnloadPrompt) return;
   if (isDirty() || busy) { e.preventDefault(); e.returnValue = ''; }
 });
 
