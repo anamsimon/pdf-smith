@@ -715,8 +715,6 @@ a:hover { color: var(--accent-hover); }
   text-decoration: none;
 }
 .support-link:hover { color: var(--ink); }
-.export-foot { display: flex; flex-direction: column; }
-.start-foot .bug-link { color: var(--accent); font-weight: 500; }
 
 /* Working */
 .work-progress { display: flex; flex-direction: column; gap: 8px; }
