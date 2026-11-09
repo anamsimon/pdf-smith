@@ -80,10 +80,13 @@ let draggingKey = null;
 let dropBeforeKey = null;
 
 let currentFile = null;
-let loadedBytesTotal = 0;
 let savedStateJSON = '[]';
 let previewRenderObserver = null;
 let previewGeneration = 0;
+// Bumped whenever a file is opened or closed; async loads stop once it changes
+// so an abandoned load can't write into the next session.
+let loadGeneration = 0;
+const isStale = (gen) => gen !== loadGeneration;
 let scrollSyncTimer = null;
 let scrollSyncPausedUntil = 0;
 
@@ -143,6 +146,15 @@ function currentIndex() {
 // PDF.js's getViewport({ rotation }) replaces the page's own /Rotate instead
 // of adding to it, so always combine the two.
 const viewRotation = (page, ref) => ((page.rotate || 0) + ((ref && ref.rotation) || 0)) % 360;
+
+// Chrome refuses canvases beyond ~16k px a side or ~268M px in area; stay well
+// under that so oversized pages render at reduced resolution instead of failing.
+const MAX_CANVAS_SIDE = 8192;
+const MAX_CANVAS_AREA = 40e6;
+function capRenderScale(baseViewport, scale) {
+  const { width: w, height: h } = baseViewport;
+  return Math.min(scale, MAX_CANVAS_SIDE / w, MAX_CANVAS_SIDE / h, Math.sqrt(MAX_CANVAS_AREA / (w * h)));
+}
 
 // ---- Undo / Redo history ----------------------------------------------------
 // History is a stack of pageOrder snapshots. pageOrder holds page order,
@@ -243,7 +255,10 @@ document.addEventListener('keydown', (e) => {
   }
   if (e.altKey) return;
 
-  if (activeAnn && !activeAnn.editing) {
+  // Only act on selected text when focus isn't on another control (a focused
+  // button should still respond to Enter, for example).
+  const focusOnPage = t === document.body || t === document.documentElement || previewEl.contains(t);
+  if (activeAnn && !activeAnn.editing && focusOnPage) {
     if (e.key === 'Delete' || e.key === 'Backspace') { e.preventDefault(); deleteActiveAnnotation(); return; }
     if (e.key === 'Enter') { e.preventDefault(); startEditing(); return; }
   }
@@ -374,11 +389,11 @@ changeFileBtn.addEventListener('click', () => {
   if (busy) { toast('Wait for the export to finish, or cancel it first.'); return; }
   if (isDirty() && !confirm('Close this file? Your unsaved edits will be lost.')) return;
   finalizeActive();
+  loadGeneration++;
   if (previewRenderObserver) { previewRenderObserver.disconnect(); previewRenderObserver = null; }
   zoomMode = 'width'; updateZoomUI();
   setTextMode(false);
   currentFile = null;
-  loadedBytesTotal = 0;
   docs.length = 0;
   pageOrder = [];
   originalPageCount = 0;
@@ -401,7 +416,6 @@ resetBtn.addEventListener('click', () => {
   finalizeActive();
   const hadRotations = pageOrder.some(r => (r.rotation || 0) !== 0);
   docs.length = 1;
-  loadedBytesTotal = currentFile ? currentFile.size : docs[0].bytes.byteLength;
   for (const k of Array.from(thumbCache.keys())) {
     if (!k.startsWith('0:')) thumbCache.delete(k);
   }
@@ -445,9 +459,20 @@ function isDirty() {
   return !!pageOrder.length && JSON.stringify(pageOrder) !== savedStateJSON;
 }
 
-function markSaved() {
-  savedStateJSON = JSON.stringify(pageOrder);
+// `exportedJSON` is the state the saved file was built from; edits made while
+// an export ran aren't in the file, so they stay "unsaved".
+function markSaved(exportedJSON) {
+  savedStateJSON = exportedJSON;
   updateEditStatus();
+}
+
+// Original file size of every source file that still contributes a page
+// (shown in the header; follows deletes, inserts and undo).
+function fileSizeInUse() {
+  const used = new Set(pageOrder.map(r => r.doc));
+  let sum = 0;
+  used.forEach(d => { if (docs[d]) sum += docs[d].size; });
+  return sum;
 }
 
 // Bytes of every source document that contributes at least one page.
@@ -462,7 +487,7 @@ function updateEditStatus() {
   const total = pageOrder.length;
   pageCountEl.textContent = `PAGES · ${total}`;
   resetBtn.disabled = !(isEdited() || docs.length > 1);
-  const parts = [`${total} page${total === 1 ? '' : 's'}`, fmt(loadedBytesTotal)];
+  const parts = [`${total} page${total === 1 ? '' : 's'}`, fmt(fileSizeInUse())];
   headerSubtitle.innerHTML = escapeHtml(parts.join(' · ')) +
     (isDirty() ? ' · <span class="unsaved">Unsaved edits</span>' : '');
   exportSub.textContent = `Choose how to save your ${total} page${total === 1 ? '' : 's'}.`;
@@ -489,9 +514,9 @@ async function handleFiles(files) {
   }
   if (skipped.length) toast(`Skipped ${skipped.join(', ')} — only PDF, JPG and PNG files are supported.`);
   if (!valid.length) return;
+  const gen = ++loadGeneration;
 
   currentFile = valid[0].file;
-  loadedBytesTotal = valid.reduce((s, e) => s + e.file.size, 0);
   headerTitle.textContent = valid.length === 1 ? valid[0].file.name : `${valid[0].file.name} + ${valid.length - 1} more`;
   headerTitle.title = valid.map(v => v.file.name).join('\n');
   document.title = `${valid[0].file.name} — PDF Smith`;
@@ -509,10 +534,11 @@ async function handleFiles(files) {
     const { file, isPdf } = valid[0];
     try {
       firstEntry = isPdf ? await loadDoc(file)
-        : await loadDocFromBytes(await imageFileToPdfBytes(file), file.name);
+        : await loadDocFromBytes(await imageFileToPdfBytes(file), file.name, file.size);
+      if (isStale(gen)) return;
     } catch (err) {
+      if (isStale(gen)) return;
       valid.shift();
-      loadedBytesTotal -= file.size;
       if (valid.length) toast(`Couldn't open "${file.name}": ${err.message}`);
       else {
         previewEl.innerHTML = `<div class="placeholder err">Couldn't open "${escapeHtml(file.name)}": ${escapeHtml(err.message)}</div>`;
@@ -530,7 +556,8 @@ async function handleFiles(files) {
   originalPageCount = docs[0].pdf.numPages;
   pageOrder = Array.from({ length: originalPageCount }, (_, i) => ({ doc: 0, page: i + 1, rotation: 0, annotations: [] }));
   clearHistory();
-  await renderDocThumbnails(0);
+  await renderDocThumbnails(0, gen);
+  if (isStale(gen)) return;
   rebuildThumbList();
   currentRef = pageOrder[0];
   updateThumbActive();
@@ -545,14 +572,17 @@ async function handleFiles(files) {
         entry = await loadDoc(file);
       } else {
         const pdfBytes = await imageFileToPdfBytes(file);
-        entry = await loadDocFromBytes(pdfBytes, file.name);
+        entry = await loadDocFromBytes(pdfBytes, file.name, file.size);
       }
+      if (isStale(gen)) return;
       const docIdx = docs.length;
       docs.push(entry);
-      await renderDocThumbnails(docIdx);
+      await renderDocThumbnails(docIdx, gen);
+      if (isStale(gen)) return;
       const newRefs = Array.from({ length: entry.pdf.numPages }, (_, j) => ({ doc: docIdx, page: j + 1, rotation: 0, annotations: [] }));
       pageOrder.push(...newRefs);
     } catch (err) {
+      if (isStale(gen)) return;
       toast(`Couldn't open "${file.name}": ${err.message}`);
     }
   }
@@ -568,24 +598,80 @@ async function handleFiles(files) {
 
 async function loadDoc(file) {
   const buf = await file.arrayBuffer();
-  return loadDocFromBytes(new Uint8Array(buf), file.name);
+  return loadDocFromBytes(new Uint8Array(buf), file.name, file.size);
 }
 
-async function loadDocFromBytes(bytes, name) {
+async function loadDocFromBytes(bytes, name, size = bytes.byteLength) {
   const pdf = await pdfjsLib.getDocument({ data: bytes.slice() }).promise;
-  return { pdf, bytes, name };
+  return { pdf, bytes, name, size };
+}
+
+// EXIF orientation (1–8) of a JPEG, or 1 when absent. Phone cameras store
+// pixels unrotated and rely on this tag, which pdf-lib ignores.
+function jpegOrientation(bytes) {
+  const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (v.byteLength < 4 || v.getUint16(0) !== 0xFFD8) return 1;
+  let off = 2;
+  while (off + 4 <= v.byteLength) {
+    const marker = v.getUint16(off);
+    const len = v.getUint16(off + 2);
+    if (marker === 0xFFE1 && off + 10 <= v.byteLength && v.getUint32(off + 4) === 0x45786966) { // "Exif"
+      const tiff = off + 10;
+      const le = v.getUint16(tiff) === 0x4949;
+      const ifd = tiff + v.getUint32(tiff + 4, le);
+      if (ifd + 2 > v.byteLength) return 1;
+      const n = v.getUint16(ifd, le);
+      for (let i = 0; i < n; i++) {
+        const e = ifd + 2 + i * 12;
+        if (e + 10 > v.byteLength) return 1;
+        if (v.getUint16(e, le) === 0x0112) {
+          const o = v.getUint16(e + 8, le);
+          return o >= 1 && o <= 8 ? o : 1;
+        }
+      }
+      return 1;
+    }
+    if ((marker & 0xFF00) !== 0xFF00 || marker === 0xFFDA) return 1; // start of scan / not a marker
+    off += 2 + len;
+  }
+  return 1;
+}
+
+// Decode with the browser (which applies EXIF orientation) and re-encode.
+async function redrawImage(file, asPng) {
+  const bmp = await createImageBitmap(file, { imageOrientation: 'from-image' });
+  const canvas = document.createElement('canvas');
+  canvas.width = bmp.width;
+  canvas.height = bmp.height;
+  const ctx = canvas.getContext('2d');
+  if (!asPng) { ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, canvas.width, canvas.height); }
+  ctx.drawImage(bmp, 0, 0);
+  bmp.close();
+  const blob = await new Promise(r => canvas.toBlob(r, asPng ? 'image/png' : 'image/jpeg', 0.92));
+  canvas.width = canvas.height = 0;
+  if (!blob) throw new Error('Couldn\'t read this image');
+  return new Uint8Array(await blob.arrayBuffer());
 }
 
 async function imageFileToPdfBytes(file) {
   if (typeof PDFLib === 'undefined') throw new Error('pdf-lib failed to load');
-  const bytes = new Uint8Array(await file.arrayBuffer());
+  let bytes = new Uint8Array(await file.arrayBuffer());
   const lower = file.name.toLowerCase();
   const isPng = lower.endsWith('.png') || file.type === 'image/png';
   const isJpg = lower.endsWith('.jpg') || lower.endsWith('.jpeg') || file.type === 'image/jpeg';
   if (!isPng && !isJpg) throw new Error('Unsupported image type');
 
   const newDoc = await PDFLib.PDFDocument.create();
-  const img = isPng ? await newDoc.embedPng(bytes) : await newDoc.embedJpg(bytes);
+  if (isJpg && jpegOrientation(bytes) !== 1) bytes = await redrawImage(file, false);
+  let img;
+  try {
+    img = isPng ? await newDoc.embedPng(bytes) : await newDoc.embedJpg(bytes);
+  } catch {
+    // Some valid images (e.g. unusual PNG/JPEG encodings) aren't supported by
+    // pdf-lib; let the browser decode them instead.
+    img = isPng ? await newDoc.embedPng(await redrawImage(file, true))
+                : await newDoc.embedJpg(await redrawImage(file, false));
+  }
 
   let pageW, pageH;
   if (docs[0] && docs[0].pdf.numPages > 0) {
@@ -615,10 +701,11 @@ async function imageFileToPdfBytes(file) {
 // ---- Thumbnails --------------------------------------------------------------
 const THUMB_RENDER_WIDTH = 360; // ~2x the on-screen width for sharp thumbnails
 
-async function renderDocThumbnails(docIdx) {
+async function renderDocThumbnails(docIdx, gen = loadGeneration) {
   const entry = docs[docIdx];
   const total = entry.pdf.numPages;
   for (let p = 1; p <= total; p++) {
+    if (isStale(gen)) return;
     const ref = { doc: docIdx, page: p };
     const wrap = buildThumbElement(ref);
     thumbCache.set(refKey(ref), wrap);
@@ -628,6 +715,7 @@ async function renderDocThumbnails(docIdx) {
 
 async function rerenderThumbElement(wrap, docIdx, pageNum, rotation) {
   if (!docs[docIdx]) return;
+  wrap._rot = rotation || 0; // the user rotation this thumbnail shows
   try {
     const page = await docs[docIdx].pdf.getPage(pageNum);
     rotation = viewRotation(page, { rotation });
@@ -768,6 +856,9 @@ function rebuildThumbList() {
   pageOrder.forEach((ref, idx) => {
     const el = thumbCache.get(refKey(ref));
     if (!el) return;
+    // Thumbnails are cached per source page; redraw if it shows another rotation
+    // (e.g. the page was rotated, deleted, then restored by Reset or Undo).
+    if ((el._rot || 0) !== (ref.rotation || 0)) rerenderThumbElement(el, ref.doc, ref.page, ref.rotation || 0);
     el.querySelector('.thumb-num').textContent = String(idx + 1);
     el.setAttribute('aria-label', `Page ${idx + 1}`);
     el.classList.toggle('active', !!currentRef && refKey(ref) === refKey(currentRef));
@@ -814,6 +905,7 @@ function rotatePageByKey(key) {
 async function insertBlankPage(insertIndex) {
   if (typeof PDFLib === 'undefined') { toast('pdf-lib failed to load.'); return; }
   finalizeActive();
+  const gen = loadGeneration;
   let pageW = 612, pageH = 792;
   if (docs[0] && docs[0].pdf.numPages > 0) {
     const p = await docs[0].pdf.getPage(1);
@@ -823,13 +915,16 @@ async function insertBlankPage(insertIndex) {
   const blankDoc = await PDFLib.PDFDocument.create();
   blankDoc.addPage([pageW, pageH]);
   const pdfBytes = await blankDoc.save({ useObjectStreams: true });
-  const entry = await loadDocFromBytes(pdfBytes, 'blank.pdf');
+  const entry = await loadDocFromBytes(pdfBytes, 'blank.pdf', 0); // not a file: adds nothing to the size shown
+  if (isStale(gen)) return;
   const docIdx = docs.length;
   docs.push(entry);
-  await renderDocThumbnails(docIdx);
+  await renderDocThumbnails(docIdx, gen);
+  if (isStale(gen)) return;
   const newRef = { doc: docIdx, page: 1, rotation: 0, annotations: [] };
+  finalizeActive();
   recordHistory();
-  pageOrder.splice(insertIndex, 0, newRef);
+  pageOrder.splice(Math.max(0, Math.min(insertIndex, pageOrder.length)), 0, newRef);
   currentRef = newRef;
   rebuildThumbList();
   buildContinuousPreview(newRef);
@@ -925,9 +1020,10 @@ window.addEventListener('drop', (e) => {
 
 async function insertFiles(files, insertAt) {
   finalizeActive();
+  const gen = loadGeneration;
 
-  const histSnapshot = clonePageOrder();
-  let firstNewRef = null;
+  // Load everything first; the document can keep changing while this runs.
+  const loaded = [];
   for (const file of files) {
     const kind = classifyFile(file);
     if (!kind) {
@@ -935,27 +1031,37 @@ async function insertFiles(files, insertAt) {
       continue;
     }
     try {
-      let entry;
-      if (kind === 'pdf') {
-        entry = await loadDoc(file);
-      } else {
-        const pdfBytes = await imageFileToPdfBytes(file);
-        entry = await loadDocFromBytes(pdfBytes, file.name);
-      }
-      const docIdx = docs.length;
-      docs.push(entry);
-      loadedBytesTotal += file.size;
-      await renderDocThumbnails(docIdx);
-      const newRefs = Array.from({ length: entry.pdf.numPages }, (_, i) => ({ doc: docIdx, page: i + 1, rotation: 0, annotations: [] }));
-      pageOrder.splice(insertAt, 0, ...newRefs);
-      insertAt += newRefs.length;
-      if (!firstNewRef && newRefs.length) firstNewRef = newRefs[0];
+      const entry = kind === 'pdf' ? await loadDoc(file)
+        : await loadDocFromBytes(await imageFileToPdfBytes(file), file.name, file.size);
+      if (isStale(gen)) return;
+      loaded.push(entry);
     } catch (err) {
+      if (isStale(gen)) return;
       toast(`Couldn't open "${file.name}": ${err.message}`);
     }
   }
+  if (!loaded.length || isStale(gen)) return;
 
-  if (firstNewRef) { commitHistory(histSnapshot); currentRef = firstNewRef; }
+  const startIdx = docs.length;
+  docs.push(...loaded);
+  for (let i = 0; i < loaded.length; i++) {
+    await renderDocThumbnails(startIdx + i, gen);
+    if (isStale(gen)) return;
+  }
+
+  // Snapshot and splice in one synchronous step so Undo removes exactly the insert.
+  finalizeActive();
+  recordHistory();
+  let at = Math.max(0, Math.min(insertAt, pageOrder.length));
+  let firstNewRef = null;
+  loaded.forEach((entry, i) => {
+    const docIdx = startIdx + i;
+    const newRefs = Array.from({ length: entry.pdf.numPages }, (_, p) => ({ doc: docIdx, page: p + 1, rotation: 0, annotations: [] }));
+    pageOrder.splice(at, 0, ...newRefs);
+    at += newRefs.length;
+    if (!firstNewRef) firstNewRef = newRefs[0];
+  });
+  currentRef = firstNewRef;
   rebuildThumbList();
   buildContinuousPreview(currentRef);
   updateEditStatus();
@@ -1059,13 +1165,14 @@ async function renderPageIntoSlot(slot, idx) {
     const cssScale = Math.max(cssScaleFor(baseViewport), 0.05);
     if (typeof zoomMode !== 'number') lastEffectiveZoom = cssScale / PT_TO_PX;
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    const viewport = page.getViewport({ scale: cssScale * dpr, rotation });
+    const renderScale = capRenderScale(baseViewport, cssScale * dpr);
+    const viewport = page.getViewport({ scale: renderScale, rotation });
     const canvas = slot.querySelector('canvas');
     if (slot._task) { try { slot._task.cancel(); } catch {} }
     canvas.width = Math.floor(viewport.width);
     canvas.height = Math.floor(viewport.height);
-    canvas.style.width = Math.floor(viewport.width / dpr) + 'px';
-    canvas.style.height = Math.floor(viewport.height / dpr) + 'px';
+    canvas.style.width = Math.floor(baseViewport.width * cssScale) + 'px';
+    canvas.style.height = Math.floor(baseViewport.height * cssScale) + 'px';
     slot._scale = cssScale;
     renderAnnotationLayer(slot, idx);
     const task = page.render({ canvasContext: canvas.getContext('2d'), viewport });
@@ -1087,11 +1194,36 @@ function drawAnnotationsOnCanvas(canvas, annotations, renderScale) {
     ctx.save();
     ctx.font = `${ann.italic ? 'italic ' : ''}${ann.bold ? 'bold ' : ''}${px}px ${annotFontFace(ann.fontFamily)}`;
     ctx.fillStyle = ann.color || '#000000';
-    ctx.textBaseline = 'top';
+    ctx.textBaseline = 'alphabetic';
+    const base = baselineRatio(ann);
     const lines = ann.text.split('\n');
-    lines.forEach((line, i) => ctx.fillText(line, x, y + i * px * 1.25));
+    lines.forEach((line, i) => ctx.fillText(line, x, y + (base + i * LINE_HEIGHT) * px));
     ctx.restore();
   }
+}
+
+// Where the first line's baseline sits below the text box's top edge, as a
+// fraction of the font size, measured from the browser's own layout (line-height
+// 1.25, same as the on-page preview). The compressed and Keep-quality outputs
+// place text on this baseline so saved text lands exactly where it was shown.
+const LINE_HEIGHT = 1.25;
+const baselineCache = new Map();
+function baselineRatio(ann) {
+  const key = `${ann.fontFamily}|${!!ann.bold}|${!!ann.italic}`;
+  if (baselineCache.has(key)) return baselineCache.get(key);
+  const box = document.createElement('div');
+  box.style.cssText = `position:absolute;left:-9999px;top:0;white-space:pre;font-size:100px;line-height:${LINE_HEIGHT};` +
+    `font-family:${annotFontFace(ann.fontFamily)};font-weight:${ann.bold ? 'bold' : 'normal'};font-style:${ann.italic ? 'italic' : 'normal'}`;
+  box.textContent = 'H';
+  const probe = document.createElement('span');
+  probe.style.cssText = 'display:inline-block;width:0;height:0;vertical-align:baseline';
+  box.appendChild(probe);
+  document.body.appendChild(box);
+  const ratio = (probe.getBoundingClientRect().top - box.getBoundingClientRect().top) / 100;
+  box.remove();
+  const r = ratio > 0.3 && ratio < 1.5 ? ratio : 0.95; // guard against odd layouts
+  baselineCache.set(key, r);
+  return r;
 }
 
 function annotFontFace(family) {
@@ -1612,7 +1744,6 @@ function canvasToJpegBytes(canvas, quality) {
 
 async function buildPdfAtPreset(order, preset, onPageProgress) {
   const { dpi, q } = preset;
-  const scale = dpi / 72;
   const numPages = order.length;
   const newDoc = await PDFLib.PDFDocument.create();
 
@@ -1622,6 +1753,7 @@ async function buildPdfAtPreset(order, preset, onPageProgress) {
     const page = await docs[ref.doc].pdf.getPage(ref.page);
     const rotation = viewRotation(page, ref);
     const baseViewport = page.getViewport({ scale: 1, rotation });
+    const scale = capRenderScale(baseViewport, dpi / 72);
     const viewport = page.getViewport({ scale, rotation });
 
     const canvas = document.createElement('canvas');
@@ -1668,7 +1800,7 @@ async function compressClientSide(targetBytes) {
       setProgress(p * span + span * (page / total));
     });
 
-    best = { bytes, preset, size: bytes.byteLength };
+    best = { bytes, preset, size: bytes.byteLength, orderJSON: JSON.stringify(order) };
     if (bytes.byteLength <= targetBytes) return { ...best, reachedTarget: true };
     tried.push(bytes.byteLength);
   }
@@ -1705,10 +1837,10 @@ async function runCompression(targetBytes, label) {
       setProgress(100);
       workPreset.textContent = 'Saving…';
       const saved = await downloadBytes(r.bytes, filename);
-      markSaved();
+      markSaved(r.orderJSON);
       showCompressedResult({ saved, filename, size: r.size, targetBytes, label, sourceSize, preset: r.preset, over: false });
     } else {
-      lastResult = { bytes: r.bytes, filename, size: r.size, targetBytes, label, sourceSize, preset: r.preset };
+      lastResult = { bytes: r.bytes, filename, size: r.size, targetBytes, label, sourceSize, preset: r.preset, orderJSON: r.orderJSON };
       showNotReached(lastResult);
     }
   } catch (err) {
@@ -1728,7 +1860,7 @@ async function downloadBestEffort() {
   const r = lastResult;
   try {
     const saved = await downloadBytes(r.bytes, r.filename);
-    markSaved();
+    markSaved(r.orderJSON);
     lastResult = null;
     showCompressedResult({ ...r, saved, over: true });
   } catch (err) { showError(err); }
@@ -1805,7 +1937,7 @@ function showSavedResult({ saved, filename, size }) {
     </div>
     <div class="res-stat">
       <div class="res-big"><strong>${fmt(size)}</strong><span>Full quality</span></div>
-      <div class="res-meta"><span>${total} page${total === 1 ? '' : 's'} · text stays selectable</span></div>
+      <div class="res-meta"><span>${total} page${total === 1 ? '' : 's'} · ${protectedSources.length ? 'protected pages saved as images' : 'text stays selectable'}</span></div>
     </div>
     <div class="res-actions">
       <button type="button" class="btn btn-dark btn-xl" data-action="reveal" data-download-id="${saved.downloadId}">${icon('i-folder')}Show in folder</button>
@@ -1867,20 +1999,51 @@ function encodableText(font, text) {
   return out;
 }
 
-async function buildReorganizedPdfBytes() {
+let protectedSources = []; // names of restricted PDFs whose pages had to be rendered as images
+
+// A restricted PDF (opens without a password but is encrypted against editing)
+// can't be copied by pdf-lib — its content would stay encrypted and corrupt.
+// Render such a page with PDF.js instead and embed it as a high-quality image.
+async function rasterPageForKeepQuality(newDoc, ref) {
+  const page = await docs[ref.doc].pdf.getPage(ref.page);
+  const base = page.getViewport({ scale: 1, rotation: viewRotation(page, ref) });
+  const viewport = page.getViewport({ scale: capRenderScale(base, 200 / 72), rotation: viewRotation(page, ref) });
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.floor(viewport.width);
+  canvas.height = Math.floor(viewport.height);
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  await page.render({ canvasContext: ctx, viewport }).promise;
+  const jpeg = await newDoc.embedJpg(await canvasToJpegBytes(canvas, 0.92));
+  canvas.width = canvas.height = 0;
+  const out = PDFLib.PDFPage.create(newDoc);
+  out.setSize(base.width, base.height); // rotation is baked into the image
+  out.drawImage(jpeg, { x: 0, y: 0, width: base.width, height: base.height });
+  return out;
+}
+
+async function buildReorganizedPdfBytes(order) {
   if (typeof PDFLib === 'undefined') throw new Error('pdf-lib failed to load');
   unsupportedChars = false;
+  protectedSources = [];
   const srcDocCache = new Map();
   async function getSrcDoc(docIdx) {
     if (srcDocCache.has(docIdx)) return srcDocCache.get(docIdx);
-    const d = await PDFLib.PDFDocument.load(docs[docIdx].bytes.slice());
+    let d = null;
+    try {
+      d = await PDFLib.PDFDocument.load(docs[docIdx].bytes.slice());
+    } catch (e) {
+      if (!/encrypt/i.test(e.message)) throw e;
+      protectedSources.push(docs[docIdx].name);
+    }
     srcDocCache.set(docIdx, d);
     return d;
   }
   const groups = [];
   let last = null;
-  for (let i = 0; i < pageOrder.length; i++) {
-    const r = pageOrder[i];
+  for (let i = 0; i < order.length; i++) {
+    const r = order[i];
     if (!last || last.docIdx !== r.doc) {
       last = { docIdx: r.doc, indices: [], outPositions: [] };
       groups.push(last);
@@ -1889,13 +2052,20 @@ async function buildReorganizedPdfBytes() {
     last.outPositions.push(i);
   }
   const newDoc = await PDFLib.PDFDocument.create();
-  const finalPages = new Array(pageOrder.length);
+  const finalPages = new Array(order.length);
   for (const g of groups) {
     const src = await getSrcDoc(g.docIdx);
+    if (!src) {
+      for (let k = 0; k < g.indices.length; k++) {
+        const outIdx = g.outPositions[k];
+        finalPages[outIdx] = await rasterPageForKeepQuality(newDoc, order[outIdx]);
+      }
+      continue;
+    }
     const copied = await newDoc.copyPages(src, g.indices);
     copied.forEach((page, k) => {
       const outIdx = g.outPositions[k];
-      const addRotation = pageOrder[outIdx].rotation || 0;
+      const addRotation = order[outIdx].rotation || 0;
       if (addRotation !== 0) {
         const current = page.getRotation().angle;
         page.setRotation(PDFLib.degrees((current + addRotation) % 360));
@@ -1906,15 +2076,15 @@ async function buildReorganizedPdfBytes() {
   finalPages.forEach(p => newDoc.addPage(p));
 
   // Embed text annotations
-  if (hasAnnotations()) {
+  if (order.some(r => r.annotations && r.annotations.some(a => a.text))) {
     const fontCache = new Map();
     const getFont = async (family, bold, italic) => {
       const key = `${family}_${bold}_${italic}`;
       if (!fontCache.has(key)) fontCache.set(key, await newDoc.embedFont(resolveStandardFont(family, bold, italic)));
       return fontCache.get(key);
     };
-    for (let i = 0; i < pageOrder.length; i++) {
-      const anns = pageOrder[i].annotations;
+    for (let i = 0; i < order.length; i++) {
+      const anns = order[i].annotations;
       if (!anns || !anns.length) continue;
       const pg = newDoc.getPage(i);
       // Annotations are stored in the page's *displayed* (rotated, cropped) frame.
@@ -1928,9 +2098,9 @@ async function buildReorganizedPdfBytes() {
           const color = hexToRgb(ann.color);
           const size  = ann.fontSize;
           const u = ann.xFrac, v = ann.yFrac;
-          // textBaseline='top' in canvas → baseline sits `ascent` below the top.
-          const ascent = font.heightAtSize(size);
-          const lineH  = size * 1.25;
+          // Same baseline as the on-page preview (see baselineRatio).
+          const ascent = baselineRatio(ann) * size;
+          const lineH  = size * LINE_HEIGHT;
           ann.text.split('\n').forEach((raw, li) => {
             const line = encodableText(font, raw);
             if (line !== raw) unsupportedChars = true;
@@ -2014,18 +2184,22 @@ async function saveAsIs() {
   submitLabel.textContent = 'Saving…';
   try {
     let bytes, name;
+    const order = clonePageOrder(); // the file reflects the state when Save was clicked
+    const orderJSON = JSON.stringify(order);
     if (!isEdited() && classifyFile(currentFile) === 'pdf') {
       bytes = docs[0].bytes;
       name = currentFile.name;
     } else {
-      bytes = await buildReorganizedPdfBytes();
+      bytes = await buildReorganizedPdfBytes(order);
       const suffix = !isEdited() ? '' : hasInsertedDocs() ? '-merged' : hasAnnotations() ? '-annotated' : '-reorganized';
       name = `${baseName()}${suffix}.pdf`;
     }
     const saved = await downloadBytes(bytes, name);
-    markSaved();
+    markSaved(orderJSON);
     showSavedResult({ saved, filename: name, size: saved.size });
-    if (unsupportedChars) {
+    if (protectedSources.length) {
+      toast(`${protectedSources.join(', ')} is protected against editing, so its pages were saved as high-quality images. Their text can't be selected in the new file.`, 9000);
+    } else if (unsupportedChars) {
       toast("Some characters in your text aren't supported by the standard PDF fonts and were saved as \"?\". Use Compress to a size to keep them exactly as shown.", 8000);
     }
   } catch (err) {
