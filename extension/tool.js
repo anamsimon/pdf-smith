@@ -85,6 +85,7 @@ let savedStateJSON = '[]';
 let previewRenderObserver = null;
 let previewGeneration = 0;
 let scrollSyncTimer = null;
+let scrollSyncPausedUntil = 0;
 
 // zoomMode: 'width' | 'page' | number (1 = 100% = actual size)
 let zoomMode = 'width';
@@ -138,6 +139,10 @@ function currentIndex() {
   const i = pageOrder.findIndex(r => refKey(r) === refKey(currentRef));
   return i < 0 ? 0 : i;
 }
+
+// PDF.js's getViewport({ rotation }) replaces the page's own /Rotate instead
+// of adding to it, so always combine the two.
+const viewRotation = (page, ref) => ((page.rotate || 0) + ((ref && ref.rotation) || 0)) % 360;
 
 // ---- Undo / Redo history ----------------------------------------------------
 // History is a stack of pageOrder snapshots. pageOrder holds page order,
@@ -315,9 +320,16 @@ function buildZoomOptions() {
 }
 buildZoomOptions();
 
+// Zoom of the page you're looking at (fit modes differ per page size).
+function effectiveZoom() {
+  if (typeof zoomMode === 'number') return zoomMode;
+  const slot = previewEl.querySelectorAll('.preview-page')[currentIndex()];
+  return slot && slot._scale ? slot._scale / PT_TO_PX : lastEffectiveZoom;
+}
+
 function updateZoomUI() {
   zoomSelect.value = typeof zoomMode === 'number' ? String(zoomMode) : zoomMode;
-  const z = typeof zoomMode === 'number' ? zoomMode : lastEffectiveZoom;
+  const z = effectiveZoom();
   zoomOutBtn.disabled = z <= ZOOM_STEPS[0] + 0.001;
   zoomInBtn.disabled = z >= ZOOM_STEPS[ZOOM_STEPS.length - 1] - 0.001;
 }
@@ -331,12 +343,12 @@ zoomSelect.addEventListener('change', () => {
   setZoom(v === 'width' || v === 'page' ? v : parseFloat(v));
 });
 zoomInBtn.addEventListener('click', () => {
-  const z = typeof zoomMode === 'number' ? zoomMode : lastEffectiveZoom;
+  const z = effectiveZoom();
   const next = ZOOM_STEPS.find(s => s > z + 0.01);
   if (next) setZoom(next);
 });
 zoomOutBtn.addEventListener('click', () => {
-  const z = typeof zoomMode === 'number' ? zoomMode : lastEffectiveZoom;
+  const z = effectiveZoom();
   const prev = [...ZOOM_STEPS].reverse().find(s => s < z - 0.01);
   if (prev) setZoom(prev);
 });
@@ -385,6 +397,7 @@ changeFileBtn.addEventListener('click', () => {
 
 resetBtn.addEventListener('click', () => {
   if (!docs[0]) return;
+  if (busy) { toast('Wait for the export to finish, or cancel it first.'); return; }
   finalizeActive();
   const hadRotations = pageOrder.some(r => (r.rotation || 0) !== 0);
   docs.length = 1;
@@ -396,7 +409,12 @@ resetBtn.addEventListener('click', () => {
   if (!currentRef || currentRef.doc !== 0 || currentRef.page > originalPageCount) {
     currentRef = pageOrder[0];
   }
-  if (hadRotations) renderDocThumbnails(0);
+  if (hadRotations) {
+    for (let p = 1; p <= originalPageCount; p++) {
+      const wrap = thumbCache.get(`0:${p}`);
+      if (wrap) rerenderThumbElement(wrap, 0, p, 0);
+    }
+  }
   clearHistory();
   rebuildThumbList();
   buildContinuousPreview(currentRef);
@@ -485,22 +503,29 @@ async function handleFiles(files) {
   viewer.classList.remove('hidden');
   previewEl.innerHTML = '<div class="placeholder">Loading preview…</div>';
 
-  // Load first file as the base document
-  try {
-    let firstEntry;
-    if (valid[0].isPdf) {
-      firstEntry = await loadDoc(valid[0].file);
-    } else {
-      const pdfBytes = await imageFileToPdfBytes(valid[0].file);
-      firstEntry = await loadDocFromBytes(pdfBytes, valid[0].file.name);
+  // Load the first file that opens as the base document.
+  let firstEntry = null;
+  while (valid.length && !firstEntry) {
+    const { file, isPdf } = valid[0];
+    try {
+      firstEntry = isPdf ? await loadDoc(file)
+        : await loadDocFromBytes(await imageFileToPdfBytes(file), file.name);
+    } catch (err) {
+      valid.shift();
+      loadedBytesTotal -= file.size;
+      if (valid.length) toast(`Couldn't open "${file.name}": ${err.message}`);
+      else {
+        previewEl.innerHTML = `<div class="placeholder err">Couldn't open "${escapeHtml(file.name)}": ${escapeHtml(err.message)}</div>`;
+        return;
+      }
     }
-    docs.length = 0;
-    thumbCache.clear();
-    docs.push(firstEntry);
-  } catch (err) {
-    previewEl.innerHTML = `<div class="placeholder err">Couldn't open this file: ${escapeHtml(err.message)}</div>`;
-    return;
   }
+  currentFile = valid[0].file;
+  headerTitle.textContent = valid.length === 1 ? currentFile.name : `${currentFile.name} + ${valid.length - 1} more`;
+  document.title = `${currentFile.name} — PDF Smith`;
+  docs.length = 0;
+  thumbCache.clear();
+  docs.push(firstEntry);
 
   originalPageCount = docs[0].pdf.numPages;
   pageOrder = Array.from({ length: originalPageCount }, (_, i) => ({ doc: 0, page: i + 1, rotation: 0, annotations: [] }));
@@ -605,6 +630,7 @@ async function rerenderThumbElement(wrap, docIdx, pageNum, rotation) {
   if (!docs[docIdx]) return;
   try {
     const page = await docs[docIdx].pdf.getPage(pageNum);
+    rotation = viewRotation(page, { rotation });
     const baseViewport = page.getViewport({ scale: 1, rotation });
     const scale = THUMB_RENDER_WIDTH / baseViewport.width;
     const viewport = page.getViewport({ scale, rotation });
@@ -757,7 +783,19 @@ function rotatePageByKey(key) {
   if (!entries.length) return;
   recordHistory();
   const newRot = ((entries[0].rotation || 0) + 90) % 360;
-  entries.forEach(r => { r.rotation = newRot; });
+  entries.forEach(r => {
+    r.rotation = newRot;
+    // A 90° clockwise turn maps the anchor (x, y) to (1 - y, x).
+    (r.annotations || []).forEach(a => {
+      const x = a.xFrac, y = a.yFrac;
+      a.xFrac = Math.max(0, Math.min(1, 1 - y));
+      a.yFrac = Math.max(0, Math.min(1, x));
+    });
+  });
+  previewEl.querySelectorAll('.preview-page').forEach(slot => {
+    const idx = parseInt(slot.dataset.idx);
+    if (pageOrder[idx] && refKey(pageOrder[idx]) === key) refreshSlotAnnotations(idx);
+  });
   const wrap = thumbCache.get(key);
   if (wrap) {
     const [docIdx, pageNum] = key.split(':').map(Number);
@@ -844,7 +882,10 @@ function selectPage(ref) {
   const idx = pageOrder.findIndex(r => r === ref || refKey(r) === refKey(ref));
   if (idx >= 0) {
     const slot = previewEl.querySelectorAll('.preview-page')[idx];
-    if (slot) slot.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    if (slot) {
+      scrollSyncPausedUntil = Date.now() + 800;
+      slot.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
   }
 }
 
@@ -854,13 +895,36 @@ function triggerInsert(insertIndex) {
   insertFileInput.click();
 }
 
-insertFileInput.addEventListener('change', async () => {
+insertFileInput.addEventListener('change', () => {
   const files = Array.from(insertFileInput.files);
-  if (!files.length) return;
-  if (pendingInsertIndex == null) return;
-  finalizeActive();
-  let insertAt = pendingInsertIndex;
+  if (!files.length || pendingInsertIndex == null) return;
+  const at = pendingInsertIndex;
   pendingInsertIndex = null;
+  insertFiles(files, at);
+});
+
+const hasFiles = (e) => e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files');
+window.addEventListener('dragover', (e) => { if (hasFiles(e)) e.preventDefault(); });
+window.addEventListener('drop', (e) => {
+  if (!hasFiles(e)) return;
+  e.preventDefault();
+  if (viewer.classList.contains('hidden') || !docs.length || !e.dataTransfer.files.length) return;
+  if (busy) { toast('Wait for the export to finish before adding files.'); return; }
+  // Dropped on the page rail: insert where the cursor is; elsewhere: after the current page.
+  let at = currentIndex() + 1;
+  if (e.target.closest && e.target.closest('.pages')) {
+    const thumbs = Array.from(thumbsEl.querySelectorAll('.thumb'));
+    at = thumbs.length;
+    for (let i = 0; i < thumbs.length; i++) {
+      const r = thumbs[i].getBoundingClientRect();
+      if (e.clientY < r.top + r.height / 2) { at = i; break; }
+    }
+  }
+  insertFiles(Array.from(e.dataTransfer.files), at);
+});
+
+async function insertFiles(files, insertAt) {
+  finalizeActive();
 
   const histSnapshot = clonePageOrder();
   let firstNewRef = null;
@@ -896,7 +960,7 @@ insertFileInput.addEventListener('change', async () => {
   buildContinuousPreview(currentRef);
   updateEditStatus();
   updateThumbActive();
-});
+}
 
 // ---- Preview -----------------------------------------------------------------
 function previewInnerSize() {
@@ -916,6 +980,7 @@ function cssScaleFor(baseViewport) {
 function buildContinuousPreview(scrollToRef) {
   finalizeActive();
   if (previewRenderObserver) { previewRenderObserver.disconnect(); previewRenderObserver = null; }
+  previewEl.querySelectorAll('.preview-page').forEach(s => { if (s._task) { try { s._task.cancel(); } catch {} } });
   previewEl.innerHTML = '';
   if (!pageOrder.length) return;
 
@@ -955,7 +1020,10 @@ function buildContinuousPreview(scrollToRef) {
     if (scrollToRef) {
       const idx = pageOrder.findIndex(r => r === scrollToRef || refKey(r) === refKey(scrollToRef));
       const slots = previewEl.querySelectorAll('.preview-page');
-      if (idx >= 0 && slots[idx]) slots[idx].scrollIntoView({ block: 'start' });
+      if (idx >= 0 && slots[idx]) {
+        scrollSyncPausedUntil = Date.now() + 300;
+        slots[idx].scrollIntoView({ block: 'start' });
+      }
     }
   });
   updateZoomUI();
@@ -970,7 +1038,7 @@ async function sizeSlots(gen) {
     try {
       const page = await docs[ref.doc].pdf.getPage(ref.page);
       if (gen !== previewGeneration) return;
-      const base = page.getViewport({ scale: 1, rotation: ref.rotation || 0 });
+      const base = page.getViewport({ scale: 1, rotation: viewRotation(page, ref) });
       const s = cssScaleFor(base);
       const c = slots[i] && slots[i].querySelector('canvas');
       if (c && !slots[i].dataset.rendered) {
@@ -984,9 +1052,9 @@ async function sizeSlots(gen) {
 async function renderPageIntoSlot(slot, idx) {
   const ref = pageOrder[idx];
   if (!ref || !docs[ref.doc]) return;
-  const rotation = ref.rotation || 0;
   try {
     const page = await docs[ref.doc].pdf.getPage(ref.page);
+    const rotation = viewRotation(page, ref);
     const baseViewport = page.getViewport({ scale: 1, rotation });
     const cssScale = Math.max(cssScaleFor(baseViewport), 0.05);
     if (typeof zoomMode !== 'number') lastEffectiveZoom = cssScale / PT_TO_PX;
@@ -1078,6 +1146,7 @@ function refreshSlotAnnotations(idx) {
 }
 
 function syncActivePageFromScroll() {
+  if (Date.now() < scrollSyncPausedUntil) return;
   const slots = previewEl.querySelectorAll('.preview-page');
   if (!slots.length) return;
   const scrollMid = previewEl.scrollTop + previewEl.clientHeight / 2;
@@ -1380,7 +1449,7 @@ function endAnnotationDrag(e) {
   try { ds.annEl.releasePointerCapture(e.pointerId); } catch {}
   if (ds.moved) {
     commitHistory(ds.preSnapshot); // pre-move snapshot is the undo target
-    if (activeAnn) activeAnn.dirty = true;
+    if (activeAnn) activeAnn.dirty = false; // later edits get their own undo step
     updateEditStatus();
   }
   // Let the click handler see `moved` before clearing.
@@ -1550,8 +1619,8 @@ async function buildPdfAtPreset(order, preset, onPageProgress) {
   for (let i = 0; i < numPages; i++) {
     if (cancelRequested) throw new CancelledError('Cancelled');
     const ref = order[i];
-    const rotation = ref.rotation || 0;
     const page = await docs[ref.doc].pdf.getPage(ref.page);
+    const rotation = viewRotation(page, ref);
     const baseViewport = page.getViewport({ scale: 1, rotation });
     const viewport = page.getViewport({ scale, rotation });
 
@@ -1785,8 +1854,22 @@ function resolveStandardFont(family, bold, italic) {
   return 'Times-Roman';
 }
 
+let unsupportedChars = false;
+
+// Standard PDF fonts only cover WinAnsi. Replace characters they can't encode
+// with "?" instead of letting pdf-lib throw and drop the whole line.
+function encodableText(font, text) {
+  try { font.encodeText(text); return text; } catch {}
+  let out = '';
+  for (const ch of text) {
+    try { font.encodeText(ch); out += ch; } catch { out += '?'; }
+  }
+  return out;
+}
+
 async function buildReorganizedPdfBytes() {
   if (typeof PDFLib === 'undefined') throw new Error('pdf-lib failed to load');
+  unsupportedChars = false;
   const srcDocCache = new Map();
   async function getSrcDoc(docIdx) {
     if (srcDocCache.has(docIdx)) return srcDocCache.get(docIdx);
@@ -1834,21 +1917,31 @@ async function buildReorganizedPdfBytes() {
       const anns = pageOrder[i].annotations;
       if (!anns || !anns.length) continue;
       const pg = newDoc.getPage(i);
-      const { width: pgW, height: pgH } = pg.getSize();
+      // Annotations are stored in the page's *displayed* (rotated, cropped) frame.
+      const box = pg.getCropBox();
+      const W = box.width, H = box.height;
+      const rot = ((pg.getRotation().angle % 360) + 360) % 360;
       for (const ann of anns) {
         if (ann.type !== 'text' || !ann.text) continue;
         try {
           const font  = await getFont(ann.fontFamily, ann.bold, ann.italic);
           const color = hexToRgb(ann.color);
           const size  = ann.fontSize;
-          const x     = ann.xFrac * pgW;
-          // textBaseline='top' in canvas → PDF baseline = top - ascent
+          const u = ann.xFrac, v = ann.yFrac;
+          // textBaseline='top' in canvas → baseline sits `ascent` below the top.
           const ascent = font.heightAtSize(size);
           const lineH  = size * 1.25;
-          const lines  = ann.text.split('\n');
-          lines.forEach((line, li) => {
-            const y = (1 - ann.yFrac) * pgH - ascent - li * lineH;
-            if (line) pg.drawText(line, { x, y: Math.max(y, 2), size, font, color });
+          ann.text.split('\n').forEach((raw, li) => {
+            const line = encodableText(font, raw);
+            if (line !== raw) unsupportedChars = true;
+            if (!line.trim()) return;
+            const d = ascent + li * lineH; // distance "down" the displayed page
+            let x, y;
+            if (rot === 90)       { x = v * W + d;       y = u * H; }
+            else if (rot === 180) { x = (1 - u) * W;     y = v * H + d; }
+            else if (rot === 270) { x = (1 - v) * W - d; y = (1 - u) * H; }
+            else                  { x = u * W;           y = (1 - v) * H - d; }
+            pg.drawText(line, { x: box.x + x, y: box.y + y, size, font, color, rotate: PDFLib.degrees(rot) });
           });
         } catch (e) { console.warn('text annotation draw error', e); }
       }
@@ -1865,6 +1958,8 @@ function downloadBytes(bytes, filename) {
   return new Promise((resolve, reject) => {
     const blob = new Blob([bytes], { type: 'application/pdf' });
     const url = URL.createObjectURL(blob);
+    filename = safeFilename(filename);
+    let settled = false;
     chrome.downloads.download({ url, filename, saveAs: false }, (downloadId) => {
       if (chrome.runtime.lastError) {
         URL.revokeObjectURL(url);
@@ -1873,13 +1968,15 @@ function downloadBytes(bytes, filename) {
       // Resolve the actual on-disk filename once the download finishes (Chrome
       // may add " (1)" etc. on collisions). Then revoke the blob URL.
       const listener = (delta) => {
-        if (delta.id !== downloadId || !delta.state) return;
+        if (settled || delta.id !== downloadId || !delta.state) return;
         if (delta.state.current === 'interrupted') {
+          settled = true;
           chrome.downloads.onChanged.removeListener(listener);
           URL.revokeObjectURL(url);
           return reject(new Error('The download was interrupted.'));
         }
         if (delta.state.current !== 'complete') return;
+        settled = true;
         chrome.downloads.onChanged.removeListener(listener);
         chrome.downloads.search({ id: downloadId }, (items) => {
           URL.revokeObjectURL(url);
@@ -1892,8 +1989,20 @@ function downloadBytes(bytes, filename) {
         });
       };
       chrome.downloads.onChanged.addListener(listener);
+      // Very small files can finish before the listener is attached.
+      chrome.downloads.search({ id: downloadId }, (items) => {
+        const item = items && items[0];
+        if (item && (item.state === 'complete' || item.state === 'interrupted')) {
+          listener({ id: downloadId, state: { current: item.state } });
+        }
+      });
     });
   });
+}
+
+function safeFilename(name) {
+  const cleaned = name.replace(/[\\/:*?"<>|~\u0000-\u001f]/g, '_').replace(/^[.\s]+|[.\s]+$/g, '');
+  return cleaned || 'document.pdf';
 }
 
 function revealDownload(downloadId) {
@@ -1916,6 +2025,9 @@ async function saveAsIs() {
     const saved = await downloadBytes(bytes, name);
     markSaved();
     showSavedResult({ saved, filename: name, size: saved.size });
+    if (unsupportedChars) {
+      toast("Some characters in your text aren't supported by the standard PDF fonts and were saved as \"?\". Use Compress to a size to keep them exactly as shown.", 8000);
+    }
   } catch (err) {
     showError(err);
   } finally {
@@ -1923,6 +2035,10 @@ async function saveAsIs() {
     updateExportForm();
   }
 }
+
+window.addEventListener('beforeunload', (e) => {
+  if (isDirty() || busy) { e.preventDefault(); e.returnValue = ''; }
+});
 
 updateZoomUI();
 updateExportForm();

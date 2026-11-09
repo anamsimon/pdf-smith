@@ -75,7 +75,7 @@ The tool stops at the first preset whose output is at-or-below the requested tar
 ## Limits and caveats
 
 - **Compression is lossy by design.** Each page is re-rendered as a JPEG image and embedded into a fresh PDF, so text in the output is no longer selectable or searchable. Use **Save as-is** when preserving text matters.
-- **Added text uses the standard PDF fonts.** With **Save as-is**, a line containing characters those fonts can't encode (non-Latin scripts, for example) is left out, along with any lines after it in the same text box.
+- **Added text uses the standard PDF fonts.** With **Keep quality**, characters those fonts can't encode (non-Latin scripts such as Bengali, for example) are saved as `?`, and the extension tells you when that happens. **Compress to a size** draws text as shown, so use it when you need those characters.
 - **Long PDFs at high DPI are memory-hungry** in the early presets. The browser may take a while to grind through them.
 - **MOTW on Windows.** See above — saved files carry the Internet zone tag.
 
