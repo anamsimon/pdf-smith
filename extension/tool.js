@@ -24,6 +24,17 @@ const insertMenu       = $('insertMenu');
 const insertMenuLabel  = $('insertMenuLabel');
 const undoBtn          = $('undoBtn');
 const redoBtn          = $('redoBtn');
+const shapesMenuBtn    = $('shapesMenuBtn');
+const shapesMenu       = $('shapesMenu');
+const shapeBar         = $('shapeBar');
+const spStroke         = $('spStroke');
+const spStrokeSwatch   = $('spStrokeSwatch');
+const spWidth          = $('spWidth');
+const spFillGroup      = $('spFillGroup');
+const spFill           = $('spFill');
+const spFillSwatch     = $('spFillSwatch');
+const spNoFill         = $('spNoFill');
+const spDelete         = $('spDelete');
 const modeBanner       = $('modeBanner');
 
 const zoomOutBtn       = $('zoomOutBtn');
@@ -105,6 +116,16 @@ let activeAnn = null;     // { idx, annId, editing, isNew, dirty, preSnapshot }
 let dragState = null;     // active annotation drag
 let nextAnnId = 1;
 const lastStyle = { fontFamily: 'Helvetica', fontSize: 16, bold: false, italic: false, color: '#000000' };
+
+// Shapes: stored in ref.annotations as { type: 'shape', shape, xFrac, yFrac,
+// x2Frac, y2Frac, stroke, strokeWidth (pt), fill|null }. The two points are
+// the drag start/end, so lines and boxes share one representation.
+const SHAPE_KINDS = { rect: 'rectangle', ellipse: 'ellipse', line: 'line', arrow: 'arrow' };
+const SVG_NS = 'http://www.w3.org/2000/svg';
+let shapeTool = null;     // 'rect' | 'ellipse' | 'line' | 'arrow' | null
+let activeShape = null;   // { idx, annId, dirty }
+let shapeDrag = null;     // active draw / move / resize
+const lastShapeStyle = { stroke: '#DC2626', strokeWidth: 2, fill: null };
 
 let unit = 'KB';
 let busy = false;
@@ -192,6 +213,7 @@ function clearHistory() {
 // Rebuild the UI after pageOrder is swapped to a restored snapshot.
 function applyRestoredState() {
   dragState = null;
+  shapeDrag = null;
   if (currentRef) {
     const key = refKey(currentRef);
     currentRef = pageOrder.find(r => refKey(r) === key) || pageOrder[0] || null;
@@ -241,6 +263,10 @@ document.addEventListener('keydown', (e) => {
 
   if (e.key === 'Escape') {
     if (!insertMenu.classList.contains('hidden')) { closeInsertMenu(); insertMenuBtn.focus(); return; }
+    if (!shapesMenu.classList.contains('hidden')) { closeShapesMenu(); shapesMenuBtn.focus(); return; }
+    if (shapeDrag) return;
+    if (activeShape) { deselectShape(); return; }
+    if (shapeTool) { setShapeTool(null); return; }
     if (activeAnn) { e.preventDefault(); finalizeActive(); return; }
     if (textMode) { setTextMode(false); return; }
     return;
@@ -255,16 +281,24 @@ document.addEventListener('keydown', (e) => {
   }
   if (e.altKey) return;
 
+  if (e.key === '[') { e.preventDefault(); togglePanel('pages'); return; }
+  if (e.key === ']') { e.preventDefault(); togglePanel('export'); return; }
+
   // Only act on selected text when focus isn't on another control (a focused
   // button should still respond to Enter, for example).
   const focusOnPage = t === document.body || t === document.documentElement || previewEl.contains(t);
+  if (activeShape && focusOnPage && (e.key === 'Delete' || e.key === 'Backspace')) {
+    e.preventDefault(); deleteActiveShape(); return;
+  }
   if (activeAnn && !activeAnn.editing && focusOnPage) {
     if (e.key === 'Delete' || e.key === 'Backspace') { e.preventDefault(); deleteActiveAnnotation(); return; }
     if (e.key === 'Enter') { e.preventDefault(); startEditing(); return; }
   }
   const k = e.key.toLowerCase();
+  const shapeKeys = { r: 'rect', o: 'ellipse', l: 'line', a: 'arrow' };
   if (k === 't') { e.preventDefault(); setTextMode(!textMode); }
-  else if (k === 'v') { e.preventDefault(); setTextMode(false); }
+  else if (k === 'v') { e.preventDefault(); setShapeTool(null); setTextMode(false); }
+  else if (shapeKeys[k]) { e.preventDefault(); setShapeTool(shapeTool === shapeKeys[k] ? null : shapeKeys[k]); }
 });
 
 // ---- Start screen ------------------------------------------------------------
@@ -292,12 +326,35 @@ uploader.addEventListener('drop', e => {
 function setTextMode(on) {
   textMode = !!on;
   if (!textMode) finalizeActive();
-  textModeBtn.setAttribute('aria-pressed', String(textMode));
-  selectModeBtn.setAttribute('aria-pressed', String(!textMode));
-  viewer.classList.toggle('text-mode', textMode);
-  modeBanner.classList.toggle('hidden', !textMode);
+  if (textMode) { shapeTool = null; deselectShape(); }
+  updateModeUI();
 }
-selectModeBtn.addEventListener('click', () => setTextMode(false));
+
+function setShapeTool(kind) {
+  if (textMode) { textMode = false; finalizeActive(); }
+  shapeTool = SHAPE_KINDS[kind] ? kind : null;
+  if (shapeTool) deselectShape();
+  updateModeUI();
+}
+
+function updateModeUI() {
+  textModeBtn.setAttribute('aria-pressed', String(textMode));
+  shapesMenuBtn.setAttribute('aria-pressed', String(!!shapeTool));
+  selectModeBtn.setAttribute('aria-pressed', String(!textMode && !shapeTool));
+  viewer.classList.toggle('text-mode', textMode);
+  viewer.classList.toggle('shape-mode', !!shapeTool);
+  modeBanner.classList.toggle('hidden', !textMode && !shapeTool);
+  const icon = $('modeBannerIcon'), text = $('modeBannerText');
+  if (shapeTool) {
+    icon.innerHTML = `<svg class="ic" width="14" height="14"><use href="#i-${shapeTool}"/></svg>`;
+    const how = shapeTool === 'line' || shapeTool === 'arrow' ? 'Shift snaps to 45°' : 'Shift keeps it square';
+    text.textContent = `Drag on a page to draw ${shapeTool === 'ellipse' || shapeTool === 'arrow' ? 'an' : 'a'} ${SHAPE_KINDS[shapeTool]}. ${how}. Esc to exit.`;
+  } else {
+    icon.textContent = 'T';
+    text.textContent = 'Text mode — click anywhere on a page to add text. Press Esc to exit.';
+  }
+}
+selectModeBtn.addEventListener('click', () => { setShapeTool(null); setTextMode(false); });
 textModeBtn.addEventListener('click', () => setTextMode(!textMode));
 
 function openInsertMenu() {
@@ -313,8 +370,29 @@ function closeInsertMenu() {
 }
 insertMenuBtn.addEventListener('click', (e) => {
   e.stopPropagation();
+  closeShapesMenu();
   if (insertMenu.classList.contains('hidden')) openInsertMenu(); else closeInsertMenu();
 });
+
+function openShapesMenu() {
+  shapesMenu.classList.remove('hidden');
+  shapesMenuBtn.setAttribute('aria-expanded', 'true');
+  const current = shapesMenu.querySelector(`[data-shape="${shapeTool}"]`) || shapesMenu.querySelector('.menu-item');
+  if (current) current.focus();
+}
+function closeShapesMenu() {
+  shapesMenu.classList.add('hidden');
+  shapesMenuBtn.setAttribute('aria-expanded', 'false');
+}
+shapesMenuBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  closeInsertMenu();
+  if (shapesMenu.classList.contains('hidden')) openShapesMenu(); else closeShapesMenu();
+});
+shapesMenu.querySelectorAll('[data-shape]').forEach(item => item.addEventListener('click', () => {
+  closeShapesMenu();
+  setShapeTool(item.dataset.shape);
+}));
 $('insertFileMenuItem').addEventListener('click', () => {
   closeInsertMenu();
   triggerInsert(pageOrder.length ? currentIndex() + 1 : 0);
@@ -324,7 +402,7 @@ $('insertBlankMenuItem').addEventListener('click', () => {
   insertBlankPage(pageOrder.length ? currentIndex() + 1 : 0);
 });
 document.addEventListener('click', (e) => {
-  if (!e.target.closest('.menu-wrap')) closeInsertMenu();
+  if (!e.target.closest('.menu-wrap')) { closeInsertMenu(); closeShapesMenu(); }
 });
 appendFileBtn.addEventListener('click', () => triggerInsert(pageOrder.length));
 
@@ -448,7 +526,7 @@ function isOrderChanged() {
 }
 
 function hasAnnotations() {
-  return pageOrder.some(r => r.annotations && r.annotations.some(a => a.text));
+  return pageOrder.some(r => r.annotations && r.annotations.some(a => a.text || a.type === 'shape'));
 }
 
 function isEdited() {
@@ -486,6 +564,7 @@ function sourceBytesInUse() {
 function updateEditStatus() {
   const total = pageOrder.length;
   pageCountEl.textContent = `PAGES · ${total}`;
+  $('pagesRailLabel').textContent = `PAGES · ${total}`;
   resetBtn.disabled = !(isEdited() || docs.length > 1);
   const parts = [`${total} page${total === 1 ? '' : 's'}`, fmt(fileSizeInUse())];
   headerSubtitle.innerHTML = escapeHtml(parts.join(' · ')) +
@@ -881,6 +960,11 @@ function rotatePageByKey(key) {
       const x = a.xFrac, y = a.yFrac;
       a.xFrac = Math.max(0, Math.min(1, 1 - y));
       a.yFrac = Math.max(0, Math.min(1, x));
+      if (a.type === 'shape') {
+        const x2 = a.x2Frac, y2 = a.y2Frac;
+        a.x2Frac = Math.max(0, Math.min(1, 1 - y2));
+        a.y2Frac = Math.max(0, Math.min(1, x2));
+      }
     });
   });
   previewEl.querySelectorAll('.preview-page').forEach(slot => {
@@ -1085,6 +1169,8 @@ function cssScaleFor(baseViewport) {
 
 function buildContinuousPreview(scrollToRef) {
   finalizeActive();
+  activeShape = null;
+  hideShapeBar();
   if (previewRenderObserver) { previewRenderObserver.disconnect(); previewRenderObserver = null; }
   previewEl.querySelectorAll('.preview-page').forEach(s => { if (s._task) { try { s._task.cancel(); } catch {} } });
   previewEl.innerHTML = '';
@@ -1100,6 +1186,9 @@ function buildContinuousPreview(scrollToRef) {
     wrap.className = 'page-canvas-wrap';
     const canvas = document.createElement('canvas');
     wrap.appendChild(canvas);
+    const shapeLayer = document.createElement('div');
+    shapeLayer.className = 'shape-layer';
+    wrap.appendChild(shapeLayer);
     const layer = document.createElement('div');
     layer.className = 'annot-layer';
     wrap.appendChild(layer);
@@ -1187,6 +1276,9 @@ async function renderPageIntoSlot(slot, idx) {
 function drawAnnotationsOnCanvas(canvas, annotations, renderScale) {
   const ctx = canvas.getContext('2d');
   for (const ann of annotations) {
+    if (ann.type === 'shape') drawShapeOnCanvas(ctx, ann, canvas.width, canvas.height, renderScale);
+  }
+  for (const ann of annotations) {
     if (ann.type !== 'text' || !ann.text) continue;
     const x  = ann.xFrac * canvas.width;
     const y  = ann.yFrac * canvas.height;
@@ -1244,6 +1336,7 @@ function applyAnnStyle(el, ann, scale) {
 
 // Render text annotations as interactive DOM elements overlaying the page canvas.
 function renderAnnotationLayer(slot, idx) {
+  renderShapeLayer(slot, idx);
   const layer = slot.querySelector('.annot-layer');
   if (!layer) return;
   const scale = slot._scale || 1;
@@ -1590,6 +1683,485 @@ function endAnnotationDrag(e) {
 previewEl.addEventListener('pointerup', endAnnotationDrag);
 previewEl.addEventListener('pointercancel', endAnnotationDrag);
 
+// ---- Shapes ------------------------------------------------------------------
+// One geometry function feeds all three renderers (on-page SVG, the compressed
+// canvas, and vector PDF), so saved shapes match the preview exactly.
+// W, H: displayed page size in output units; s: output units per PDF point.
+function shapeGeometry(ann, W, H, s) {
+  const x1 = ann.xFrac * W, y1 = ann.yFrac * H, x2 = ann.x2Frac * W, y2 = ann.y2Frac * H;
+  const sw = (ann.strokeWidth || 0) * s;
+  if (ann.shape === 'rect') {
+    const l = Math.min(x1, x2), r = Math.max(x1, x2), t = Math.min(y1, y2), b = Math.max(y1, y2);
+    return { body: [['M', l, t], ['L', r, t], ['L', r, b], ['L', l, b], ['Z']], closed: true, head: null };
+  }
+  if (ann.shape === 'ellipse') {
+    const cx = (x1 + x2) / 2, cy = (y1 + y2) / 2, rx = Math.abs(x2 - x1) / 2, ry = Math.abs(y2 - y1) / 2;
+    const k = 0.5522847498, kx = k * rx, ky = k * ry;
+    return {
+      body: [
+        ['M', cx + rx, cy],
+        ['C', cx + rx, cy + ky, cx + kx, cy + ry, cx, cy + ry],
+        ['C', cx - kx, cy + ry, cx - rx, cy + ky, cx - rx, cy],
+        ['C', cx - rx, cy - ky, cx - kx, cy - ry, cx, cy - ry],
+        ['C', cx + kx, cy - ry, cx + rx, cy - ky, cx + rx, cy],
+        ['Z'],
+      ],
+      closed: true, head: null,
+    };
+  }
+  if (ann.shape === 'arrow') {
+    const len = Math.hypot(x2 - x1, y2 - y1);
+    if (len > 1e-6) {
+      const ux = (x2 - x1) / len, uy = (y2 - y1) / len;
+      const L = Math.min(Math.max(sw, s) * 3 + 6 * s, len);
+      const hw = L * 0.5;
+      const bx = x2 - ux * L, by = y2 - uy * L;
+      const ex = x2 - ux * L * 0.8, ey = y2 - uy * L * 0.8;
+      return {
+        body: [['M', x1, y1], ['L', ex, ey]],
+        closed: false,
+        head: [['M', x2, y2], ['L', bx - uy * hw, by + ux * hw], ['L', bx + uy * hw, by - ux * hw], ['Z']],
+      };
+    }
+  }
+  return { body: [['M', x1, y1], ['L', x2, y2]], closed: false, head: null };
+}
+
+function pathToD(cmds, map) {
+  const f = n => (Math.round(n * 1000) / 1000).toString();
+  return cmds.map(([op, ...nums]) => {
+    if (op === 'Z') return 'Z';
+    const out = [];
+    for (let i = 0; i < nums.length; i += 2) {
+      const [x, y] = map ? map(nums[i], nums[i + 1]) : [nums[i], nums[i + 1]];
+      out.push(f(x), f(y));
+    }
+    return op + ' ' + out.join(' ');
+  }).join(' ');
+}
+
+function shapeHasFill(ann) { return (ann.shape === 'rect' || ann.shape === 'ellipse') && !!ann.fill; }
+function shapeStrokeWidth(ann) {
+  // Lines and arrows always need an outline.
+  return ann.shape === 'line' || ann.shape === 'arrow' ? Math.max(ann.strokeWidth || 0, 1) : (ann.strokeWidth || 0);
+}
+
+function drawShapeOnCanvas(ctx, ann, W, H, s) {
+  const g = shapeGeometry(ann, W, H, s);
+  const sw = shapeStrokeWidth(ann);
+  ctx.save();
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'miter';
+  const body = new Path2D(pathToD(g.body));
+  if (shapeHasFill(ann)) { ctx.fillStyle = ann.fill; ctx.fill(body); }
+  if (sw > 0) {
+    ctx.strokeStyle = ann.stroke || '#000000';
+    ctx.lineWidth = sw * s;
+    ctx.stroke(body);
+  }
+  if (g.head) { ctx.fillStyle = ann.stroke || '#000000'; ctx.fill(new Path2D(pathToD(g.head))); }
+  ctx.restore();
+}
+
+// Shapes are stored in the page's displayed (rotated, cropped) frame; map each
+// point back into PDF user space the same way text annotations are placed.
+function drawShapeOnPdfPage(pg, ann, box, rot) {
+  const W = box.width, H = box.height;
+  const sideways = rot === 90 || rot === 270;
+  const Wd = sideways ? H : W, Hd = sideways ? W : H;
+  const toPdf = (px, py) => {
+    const u = px / Wd, v = py / Hd;
+    let X, Y;
+    if (rot === 90)       { X = v * W;       Y = u * H; }
+    else if (rot === 180) { X = (1 - u) * W; Y = v * H; }
+    else if (rot === 270) { X = (1 - v) * W; Y = (1 - u) * H; }
+    else                  { X = u * W;       Y = (1 - v) * H; }
+    // drawSvgPath flips y, so hand it (X, -Y).
+    return [box.x + X, -(box.y + Y)];
+  };
+  const g = shapeGeometry(ann, Wd, Hd, 1);
+  const sw = shapeStrokeWidth(ann);
+  const opts = { x: 0, y: 0 };
+  if (shapeHasFill(ann)) opts.color = hexToRgb(ann.fill);
+  if (sw > 0) {
+    opts.borderColor = hexToRgb(ann.stroke);
+    opts.borderWidth = sw;
+    if (PDFLib.LineCapStyle) opts.borderLineCap = PDFLib.LineCapStyle.Round;
+  }
+  if (opts.color || opts.borderColor) pg.drawSvgPath(pathToD(g.body, toPdf), opts);
+  if (g.head) pg.drawSvgPath(pathToD(g.head, toPdf), { x: 0, y: 0, color: hexToRgb(ann.stroke) });
+}
+
+function svgEl(tag, attrs) {
+  const el = document.createElementNS(SVG_NS, tag);
+  for (const k in attrs) el.setAttribute(k, attrs[k]);
+  return el;
+}
+
+function renderShapeLayer(slot, idx) {
+  const layer = slot.querySelector('.shape-layer');
+  if (!layer) return;
+  layer.innerHTML = '';
+  const ref = pageOrder[idx];
+  const shapes = ref && ref.annotations ? ref.annotations.filter(a => a.type === 'shape') : [];
+  if (!shapes.length) { if (activeShape && activeShape.idx === idx) positionShapeBar(); return; }
+  const canvas = slot.querySelector('canvas');
+  const W = parseFloat(canvas.style.width) || canvas.clientWidth || 1;
+  const H = parseFloat(canvas.style.height) || canvas.clientHeight || 1;
+  const s = slot._scale || 1;
+  const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: 'none' });
+  for (const ann of shapes) {
+    if (ann.id == null) ann.id = nextAnnId++;
+    const g = shapeGeometry(ann, W, H, s);
+    const sw = shapeStrokeWidth(ann) * s;
+    const selected = activeShape && activeShape.idx === idx && activeShape.annId === ann.id;
+    const group = svgEl('g', { class: 'shape' + (selected ? ' selected' : '') });
+    const d = pathToD(g.body);
+    const fillD = g.head ? d + ' ' + pathToD(g.head) : d;
+    // Visible shape
+    if (shapeHasFill(ann)) group.appendChild(svgEl('path', { d, fill: ann.fill, stroke: 'none' }));
+    if (sw > 0) group.appendChild(svgEl('path', { d, fill: 'none', stroke: ann.stroke, 'stroke-width': sw, 'stroke-linecap': 'round', 'stroke-linejoin': 'miter' }));
+    if (g.head) group.appendChild(svgEl('path', { d: pathToD(g.head), fill: ann.stroke, stroke: 'none' }));
+    // Generous invisible hit target; closed shapes are grabbable anywhere inside.
+    const hit = svgEl('path', {
+      d: fillD, class: 'shape-hit', fill: 'none', stroke: 'transparent',
+      'stroke-width': Math.max(14, sw + 10),
+      'pointer-events': g.closed ? 'all' : 'stroke',
+      'data-idx': String(idx), 'data-ann-id': String(ann.id),
+    });
+    group.appendChild(hit);
+    if (g.closed) {
+      const xs = [ann.xFrac * W, ann.x2Frac * W], ys = [ann.yFrac * H, ann.y2Frac * H];
+      group.appendChild(svgEl('rect', {
+        class: 'shape-outline',
+        x: Math.min(...xs) - 3, y: Math.min(...ys) - 3,
+        width: Math.abs(xs[1] - xs[0]) + 6, height: Math.abs(ys[1] - ys[0]) + 6,
+      }));
+    } else {
+      group.appendChild(svgEl('path', { d, class: 'shape-outline' }));
+    }
+    svg.appendChild(group);
+  }
+  layer.appendChild(svg);
+
+  // Resize handles for the selected shape.
+  const sel = activeShape && activeShape.idx === idx ? shapes.find(a => a.id === activeShape.annId) : null;
+  if (sel) {
+    const corners = sel.shape === 'line' || sel.shape === 'arrow'
+      ? [['xFrac', 'yFrac'], ['x2Frac', 'y2Frac']]
+      : [['xFrac', 'yFrac'], ['x2Frac', 'yFrac'], ['xFrac', 'y2Frac'], ['x2Frac', 'y2Frac']];
+    for (const [hx, hy] of corners) {
+      const h = document.createElement('div');
+      h.className = 'shape-handle';
+      h.dataset.idx = String(idx);
+      h.dataset.annId = String(sel.id);
+      h.dataset.hx = hx;
+      h.dataset.hy = hy;
+      h.style.left = (sel[hx] * 100) + '%';
+      h.style.top = (sel[hy] * 100) + '%';
+      if (sel.shape === 'line' || sel.shape === 'arrow') h.style.cursor = 'crosshair';
+      else {
+        const other = k => (k.startsWith('x2') ? k.replace('x2', 'x') : k.startsWith('y2') ? k.replace('y2', 'y') : k[0] + '2Frac');
+        const left = sel[hx] <= sel[other(hx)], top = sel[hy] <= sel[other(hy)];
+        h.style.cursor = left === top ? 'nwse-resize' : 'nesw-resize';
+      }
+      layer.appendChild(h);
+    }
+  }
+  if (activeShape && activeShape.idx === idx) positionShapeBar();
+}
+
+function refreshShapes(idx) {
+  const slot = previewEl.querySelectorAll('.preview-page')[idx];
+  if (slot) renderShapeLayer(slot, idx);
+}
+
+function activeShapeAnn() {
+  return activeShape ? getAnn(activeShape.idx, activeShape.annId) : null;
+}
+
+function selectShape(idx, annId) {
+  finalizeActive();
+  if (activeShape && activeShape.idx === idx && activeShape.annId === annId) return;
+  const prev = activeShape;
+  activeShape = { idx, annId, dirty: false };
+  if (prev && prev.idx !== idx) refreshShapes(prev.idx);
+  const ann = activeShapeAnn();
+  if (ann) loadShapeBar(ann);
+  refreshShapes(idx);
+}
+
+function deselectShape() {
+  if (!activeShape) return;
+  const idx = activeShape.idx;
+  activeShape = null;
+  hideShapeBar();
+  refreshShapes(idx);
+}
+
+function deleteActiveShape() {
+  if (!activeShape) return;
+  const { idx, annId } = activeShape;
+  const ref = pageOrder[idx];
+  if (!ref) return;
+  recordHistory();
+  ref.annotations = ref.annotations.filter(a => a.id !== annId);
+  deselectShape();
+  updateEditStatus();
+}
+
+function loadShapeBar(ann) {
+  spStroke.value = ann.stroke || '#000000';
+  spStrokeSwatch.style.borderColor = spStroke.value;
+  const fillable = ann.shape === 'rect' || ann.shape === 'ellipse';
+  spFillGroup.classList.toggle('hidden', !fillable);
+  spWidth.querySelector('option[value="0"]').disabled = !fillable;
+  spWidth.value = String(ann.strokeWidth || 0);
+  if (ann.fill) spFill.value = ann.fill;
+  spFillSwatch.style.background = ann.fill || '';
+  spFillSwatch.classList.toggle('is-none', !ann.fill);
+  spNoFill.setAttribute('aria-pressed', String(!ann.fill));
+}
+
+function positionShapeBar() {
+  const ann = activeShapeAnn();
+  const slot = activeShape && previewEl.querySelectorAll('.preview-page')[activeShape.idx];
+  const wrap = slot && slot.querySelector('.page-canvas-wrap');
+  if (!ann || !wrap) { hideShapeBar(); return; }
+  if (shapeBar.parentNode !== wrap) wrap.appendChild(shapeBar);
+  shapeBar.classList.remove('hidden');
+  const wrapW = wrap.clientWidth, wrapH = wrap.clientHeight;
+  const minX = Math.min(ann.xFrac, ann.x2Frac) * wrapW;
+  const minY = Math.min(ann.yFrac, ann.y2Frac) * wrapH;
+  const maxY = Math.max(ann.yFrac, ann.y2Frac) * wrapH;
+  const barW = shapeBar.offsetWidth, barH = shapeBar.offsetHeight;
+  let left = minX;
+  if (left + barW > wrapW) left = Math.max(wrapW - barW, Math.min(left, 0));
+  let top = minY - barH - 14;
+  if (top < -24) top = maxY + 14;
+  shapeBar.style.left = left + 'px';
+  shapeBar.style.top = top + 'px';
+}
+
+function hideShapeBar() {
+  shapeBar.classList.add('hidden');
+  if (shapeBar.parentNode !== document.body) document.body.appendChild(shapeBar);
+}
+
+function updateShapeStyle(patch) {
+  const ann = activeShapeAnn();
+  if (!ann) return;
+  if (!activeShape.dirty) { recordHistory(); activeShape.dirty = true; }
+  Object.assign(ann, patch);
+  Object.assign(lastShapeStyle, patch);
+  loadShapeBar(ann);
+  refreshShapes(activeShape.idx);
+  updateEditStatus();
+}
+
+spStroke.addEventListener('input', () => updateShapeStyle({ stroke: spStroke.value }));
+spWidth.addEventListener('change', () => {
+  const w = parseFloat(spWidth.value) || 0;
+  const ann = activeShapeAnn();
+  // An outline-less shape with no fill would vanish, so give it a fill.
+  if (w === 0 && ann && !ann.fill) updateShapeStyle({ strokeWidth: 0, fill: spFill.value });
+  else updateShapeStyle({ strokeWidth: w });
+});
+spFill.addEventListener('input', () => updateShapeStyle({ fill: spFill.value }));
+spNoFill.addEventListener('click', () => {
+  const ann = activeShapeAnn();
+  if (ann && !(ann.strokeWidth > 0)) updateShapeStyle({ fill: null, strokeWidth: 2 });
+  else updateShapeStyle({ fill: null });
+});
+spDelete.addEventListener('click', deleteActiveShape);
+['pointerdown', 'click', 'dblclick'].forEach(ev => shapeBar.addEventListener(ev, e => e.stopPropagation()));
+
+// Clicking anywhere else drops the shape selection.
+document.addEventListener('pointerdown', (e) => {
+  if (!activeShape) return;
+  if (e.target.closest('.shape-hit, .shape-handle, #shapeBar')) return;
+  deselectShape();
+}, true);
+
+const clamp01 = n => Math.max(0, Math.min(1, n));
+
+previewEl.addEventListener('pointerdown', (e) => {
+  if (e.button !== 0) return;
+  if (e.target.closest('.annot, #styleBar, #shapeBar')) return;
+  const wrap = e.target.closest('.page-canvas-wrap');
+  if (!wrap) return;
+  const slot = wrap.closest('.preview-page');
+  const idx = parseInt(slot.dataset.idx);
+  const ref = pageOrder[idx];
+  if (!ref) return;
+  const rect = slot.querySelector('canvas').getBoundingClientRect();
+  const fx = clamp01((e.clientX - rect.left) / rect.width);
+  const fy = clamp01((e.clientY - rect.top) / rect.height);
+  const handle = e.target.closest('.shape-handle');
+  const hit = e.target.closest('.shape-hit');
+  let mode, ann;
+  if (handle && !shapeTool && !textMode) {
+    ann = getAnn(idx, parseInt(handle.dataset.annId));
+    mode = 'resize';
+  } else if (hit && !shapeTool && !textMode) {
+    ann = getAnn(idx, parseInt(hit.dataset.annId));
+    if (ann) selectShape(idx, ann.id);
+    mode = 'move';
+  } else if (shapeTool) {
+    finalizeActive();
+    const preSnapshot = clonePageOrder();
+    if (!ref.annotations) ref.annotations = [];
+    ann = { id: nextAnnId++, type: 'shape', shape: shapeTool, xFrac: fx, yFrac: fy, x2Frac: fx, y2Frac: fy, ...lastShapeStyle };
+    if (ann.shape === 'line' || ann.shape === 'arrow') ann.strokeWidth = Math.max(ann.strokeWidth || 0, 1);
+    else if (!ann.fill && !(ann.strokeWidth > 0)) ann.strokeWidth = 2;
+    ref.annotations.push(ann);
+    activeShape = { idx, annId: ann.id, dirty: false };
+    mode = 'draw';
+    shapeDrag = { preSnapshot };
+  }
+  if (!mode || !ann) return;
+  e.preventDefault();
+  shapeDrag = {
+    ...(shapeDrag || {}),
+    mode, idx, ann, rect, slot,
+    hx: handle && handle.dataset.hx, hy: handle && handle.dataset.hy,
+    startX: e.clientX, startY: e.clientY,
+    start: { xFrac: ann.xFrac, yFrac: ann.yFrac, x2Frac: ann.x2Frac, y2Frac: ann.y2Frac },
+    moved: false,
+    preSnapshot: (shapeDrag && shapeDrag.preSnapshot) || clonePageOrder(),
+  };
+  try { previewEl.setPointerCapture(e.pointerId); } catch {}
+  if (mode === 'draw') { hideShapeBar(); refreshShapes(idx); }
+});
+
+previewEl.addEventListener('pointermove', (e) => {
+  const sd = shapeDrag;
+  if (!sd) return;
+  if (Math.abs(e.clientX - sd.startX) > 3 || Math.abs(e.clientY - sd.startY) > 3) sd.moved = true;
+  if (!sd.moved) return;
+  const { ann, rect, start } = sd;
+  const fx = clamp01((e.clientX - rect.left) / rect.width);
+  const fy = clamp01((e.clientY - rect.top) / rect.height);
+  if (sd.mode === 'move') {
+    let dx = (e.clientX - sd.startX) / rect.width;
+    let dy = (e.clientY - sd.startY) / rect.height;
+    dx = Math.max(-Math.min(start.xFrac, start.x2Frac), Math.min(1 - Math.max(start.xFrac, start.x2Frac), dx));
+    dy = Math.max(-Math.min(start.yFrac, start.y2Frac), Math.min(1 - Math.max(start.yFrac, start.y2Frac), dy));
+    ann.xFrac = start.xFrac + dx; ann.x2Frac = start.x2Frac + dx;
+    ann.yFrac = start.yFrac + dy; ann.y2Frac = start.y2Frac + dy;
+  } else {
+    // draw moves the end point; resize moves whichever corner was grabbed.
+    const hx = sd.mode === 'draw' ? 'x2Frac' : sd.hx;
+    const hy = sd.mode === 'draw' ? 'y2Frac' : sd.hy;
+    const ox = sd.mode === 'draw' ? 'xFrac' : (hx === 'xFrac' ? 'x2Frac' : 'xFrac');
+    const oy = sd.mode === 'draw' ? 'yFrac' : (hy === 'yFrac' ? 'y2Frac' : 'yFrac');
+    let px = fx, py = fy;
+    if (e.shiftKey) {
+      const ax = ann[ox] * rect.width, ay = ann[oy] * rect.height;
+      let dxp = px * rect.width - ax, dyp = py * rect.height - ay;
+      if (ann.shape === 'line' || ann.shape === 'arrow') {
+        const len = Math.hypot(dxp, dyp);
+        const ang = Math.round(Math.atan2(dyp, dxp) / (Math.PI / 4)) * (Math.PI / 4);
+        dxp = Math.cos(ang) * len; dyp = Math.sin(ang) * len;
+      } else {
+        const m = Math.max(Math.abs(dxp), Math.abs(dyp));
+        dxp = Math.sign(dxp || 1) * m; dyp = Math.sign(dyp || 1) * m;
+      }
+      px = clamp01((ax + dxp) / rect.width);
+      py = clamp01((ay + dyp) / rect.height);
+    }
+    ann[hx] = px;
+    ann[hy] = py;
+  }
+  renderShapeLayer(sd.slot, sd.idx);
+});
+
+function endShapeDrag(e) {
+  const sd = shapeDrag;
+  if (!sd) return;
+  shapeDrag = null;
+  try { previewEl.releasePointerCapture(e.pointerId); } catch {}
+  const { ann, rect } = sd;
+  if (sd.mode === 'draw') {
+    const tiny = Math.abs(ann.x2Frac - ann.xFrac) * rect.width < 4 && Math.abs(ann.y2Frac - ann.yFrac) * rect.height < 4;
+    if (!sd.moved || tiny) {
+      // A plain click drops a default-sized shape.
+      const isLine = ann.shape === 'line' || ann.shape === 'arrow';
+      const w = (isLine ? 140 : 120) / rect.width, h = (isLine ? 0 : 80) / rect.height;
+      ann.x2Frac = clamp01(ann.xFrac + w);
+      ann.y2Frac = clamp01(ann.yFrac + h);
+      if (ann.x2Frac === ann.xFrac) ann.xFrac = clamp01(ann.x2Frac - w);
+      if (!isLine && ann.y2Frac === ann.yFrac) ann.yFrac = clamp01(ann.y2Frac - h);
+    }
+    commitHistory(sd.preSnapshot);
+    const { idx, annId } = { idx: sd.idx, annId: ann.id };
+    setShapeTool(null);           // back to select so the new shape can be adjusted
+    activeShape = { idx, annId, dirty: false };
+    loadShapeBar(ann);
+    refreshShapes(idx);
+  } else if (sd.moved) {
+    commitHistory(sd.preSnapshot);
+    if (activeShape) activeShape.dirty = false;
+    refreshShapes(sd.idx);
+  }
+  updateEditStatus();
+}
+previewEl.addEventListener('pointerup', endShapeDrag);
+previewEl.addEventListener('pointercancel', endShapeDrag);
+
+// ---- Collapsible side panels -------------------------------------------------
+const edBody = document.querySelector('.ed-body');
+const PANEL_KEY = 'pdfsmith.collapsed';
+const panelUi = {
+  pages:  { collapse: $('pagesCollapseBtn'),  expand: $('pagesExpandBtn'),  label: $('pagesRailLabel') },
+  export: { collapse: $('exportCollapseBtn'), expand: $('exportExpandBtn'), label: $('exportRailLabel') },
+};
+
+function isCollapsed(name) { return edBody.classList.contains(`${name}-collapsed`); }
+
+function setPanelCollapsed(name, collapsed, { focus = false, persist = true } = {}) {
+  if (isCollapsed(name) === collapsed) return;
+  edBody.classList.toggle(`${name}-collapsed`, collapsed);
+  const ui = panelUi[name];
+  ui.collapse.setAttribute('aria-expanded', String(!collapsed));
+  ui.expand.setAttribute('aria-expanded', String(!collapsed));
+  if (focus) (collapsed ? ui.expand : ui.collapse).focus();
+  if (persist) {
+    try {
+      localStorage.setItem(PANEL_KEY, JSON.stringify({ pages: isCollapsed('pages'), export: isCollapsed('export') }));
+    } catch (_) { /* storage unavailable */ }
+  }
+  refitAfterPanelChange();
+}
+
+function togglePanel(name) {
+  if (window.matchMedia('(max-width: 940px)').matches) return;
+  setPanelCollapsed(name, !isCollapsed(name), { focus: document.activeElement !== document.body });
+}
+
+// Re-fit the preview once the grid column transition finishes.
+let panelRefitTimer;
+function refitAfterPanelChange() {
+  if (!currentRef) return;
+  clearTimeout(panelRefitTimer);
+  panelRefitTimer = setTimeout(() => buildContinuousPreview(currentRef), 230);
+}
+
+for (const name of Object.keys(panelUi)) {
+  const ui = panelUi[name];
+  ui.collapse.addEventListener('click', () => setPanelCollapsed(name, true, { focus: true }));
+  ui.expand.addEventListener('click', () => setPanelCollapsed(name, false, { focus: true }));
+  ui.label.addEventListener('click', () => setPanelCollapsed(name, false, { focus: true }));
+}
+
+try {
+  const saved = JSON.parse(localStorage.getItem(PANEL_KEY) || 'null');
+  if (saved) {
+    if (saved.pages) setPanelCollapsed('pages', true, { persist: false });
+    if (saved.export) setPanelCollapsed('export', true, { persist: false });
+  }
+} catch (_) { /* ignore bad or blocked storage */ }
+
 let resizeTimer;
 window.addEventListener('resize', () => {
   if (!currentRef) return;
@@ -1651,6 +2223,8 @@ function showExportView(which) {
   exportForm.classList.toggle('hidden', which !== 'form');
   exportWorking.classList.toggle('hidden', which !== 'working');
   result.classList.toggle('hidden', which !== 'result');
+  // Progress and results live in the export panel, so make sure it's visible.
+  if (which !== 'form') setPanelCollapsed('export', false, { persist: false });
 }
 
 function showFormError(msg) {
@@ -2076,7 +2650,7 @@ async function buildReorganizedPdfBytes(order) {
   finalPages.forEach(p => newDoc.addPage(p));
 
   // Embed text annotations
-  if (order.some(r => r.annotations && r.annotations.some(a => a.text))) {
+  if (order.some(r => r.annotations && r.annotations.some(a => a.text || a.type === 'shape'))) {
     const fontCache = new Map();
     const getFont = async (family, bold, italic) => {
       const key = `${family}_${bold}_${italic}`;
@@ -2092,6 +2666,10 @@ async function buildReorganizedPdfBytes(order) {
       const W = box.width, H = box.height;
       const rot = ((pg.getRotation().angle % 360) + 360) % 360;
       for (const ann of anns) {
+        if (ann.type === 'shape') {
+          try { drawShapeOnPdfPage(pg, ann, box, rot); } catch (e) { console.warn('shape draw error', e); }
+          continue;
+        }
         if (ann.type !== 'text' || !ann.text) continue;
         try {
           const font  = await getFont(ann.fontFamily, ann.bold, ann.italic);
