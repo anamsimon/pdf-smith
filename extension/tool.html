@@ -38,6 +38,8 @@
       <symbol id="i-ellipse" viewBox="0 0 24 24"><ellipse cx="12" cy="12" rx="9" ry="7"/></symbol>
       <symbol id="i-line" viewBox="0 0 24 24"><path d="M5 19 19 5"/></symbol>
       <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 19 19 5"/><path d="M10 5h9v9"/></symbol>
+      <symbol id="i-chev-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+      <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
       <symbol id="i-blank" viewBox="0 0 24 24"><rect x="5" y="3" width="14" height="18" rx="2"/></symbol>
     </defs>
   </svg>
@@ -101,6 +103,18 @@
         </div>
       </div>
 
+      <div class="restore-card hidden" id="restoreCard" role="region" aria-label="Unsaved session">
+        <span class="restore-icon"><svg class="ic" width="20" height="20"><use href="#i-undo"/></svg></span>
+        <span class="restore-copy">
+          <span class="restore-title">Pick up where you left off</span>
+          <span class="restore-sub" id="restoreSub"></span>
+        </span>
+        <span class="restore-actions">
+          <button type="button" class="btn btn-outline btn-sm" id="discardDraftBtn">Discard</button>
+          <button type="button" class="btn btn-primary btn-sm" id="restoreDraftBtn">Restore</button>
+        </span>
+      </div>
+
       <p class="start-foot">Files are saved to your browser's Downloads folder.</p>
     </main>
   </div>
@@ -117,27 +131,26 @@
       </div>
 
       <div class="toolbar" role="toolbar" aria-label="Editing tools">
-        <button type="button" class="tool" id="selectModeBtn" aria-pressed="true">
+        <button type="button" class="tool" id="selectModeBtn" aria-pressed="true" title="Select (V)">
           <svg class="ic" width="16" height="16"><use href="#i-pointer"/></svg><span class="tool-label">Select</span></button>
         <button type="button" class="tool" id="textModeBtn" aria-pressed="false" title="Add text (T)">
           <svg class="ic" width="16" height="16"><use href="#i-text"/></svg><span class="tool-label">Add text</span></button>
-        <div class="menu-wrap">
-          <button type="button" class="tool" id="shapesMenuBtn" aria-haspopup="true" aria-expanded="false" aria-pressed="false">
-            <svg class="ic" width="16" height="16"><use href="#i-shapes"/></svg><span class="tool-label">Shapes</span></button>
-          <div class="menu hidden" id="shapesMenu" role="menu">
-            <button type="button" role="menuitem" class="menu-item" data-shape="rect">
-              <svg class="ic" width="16" height="16"><use href="#i-rect"/></svg>Rectangle<kbd>R</kbd></button>
-            <button type="button" role="menuitem" class="menu-item" data-shape="ellipse">
-              <svg class="ic" width="16" height="16"><use href="#i-ellipse"/></svg>Ellipse<kbd>O</kbd></button>
-            <button type="button" role="menuitem" class="menu-item" data-shape="line">
-              <svg class="ic" width="16" height="16"><use href="#i-line"/></svg>Line<kbd>L</kbd></button>
-            <button type="button" role="menuitem" class="menu-item" data-shape="arrow">
-              <svg class="ic" width="16" height="16"><use href="#i-arrow"/></svg>Arrow<kbd>A</kbd></button>
-          </div>
+        <span class="toolbar-sep"></span>
+        <div class="tool-group" role="group" aria-label="Shapes" id="shapeTools">
+          <button type="button" class="tool tool-icon" data-shape="rect" aria-pressed="false" aria-label="Rectangle (R)" title="Rectangle (R)">
+            <svg class="ic" width="18" height="18"><use href="#i-rect"/></svg></button>
+          <button type="button" class="tool tool-icon" data-shape="ellipse" aria-pressed="false" aria-label="Ellipse (O)" title="Ellipse (O)">
+            <svg class="ic" width="18" height="18"><use href="#i-ellipse"/></svg></button>
+          <button type="button" class="tool tool-icon" data-shape="line" aria-pressed="false" aria-label="Line (L)" title="Line (L)">
+            <svg class="ic" width="18" height="18"><use href="#i-line"/></svg></button>
+          <button type="button" class="tool tool-icon" data-shape="arrow" aria-pressed="false" aria-label="Arrow (A)" title="Arrow (A)">
+            <svg class="ic" width="18" height="18"><use href="#i-arrow"/></svg></button>
         </div>
+        <span class="toolbar-sep"></span>
         <div class="menu-wrap">
-          <button type="button" class="tool" id="insertMenuBtn" aria-haspopup="true" aria-expanded="false">
-            <svg class="ic" width="16" height="16"><use href="#i-plus"/></svg><span class="tool-label">Insert</span></button>
+          <button type="button" class="tool" id="insertMenuBtn" aria-haspopup="true" aria-expanded="false" title="Insert pages">
+            <svg class="ic" width="16" height="16"><use href="#i-plus"/></svg><span class="tool-label">Insert</span>
+            <svg class="ic tool-caret" width="14" height="14"><use href="#i-chev-down"/></svg></button>
           <div class="menu hidden" id="insertMenu" role="menu">
             <div class="menu-label" id="insertMenuLabel">After page 1</div>
             <button type="button" role="menuitem" class="menu-item" id="insertFileMenuItem">
@@ -154,7 +167,106 @@
       </div>
 
       <div class="ed-header-actions">
-        <button type="button" class="btn btn-outline btn-sm" id="changeFileBtn">Close</button>
+        <span class="autosave-status" id="autosaveStatus" aria-live="polite"></span>
+        <button type="button" class="autosave-switch" id="autosaveBtn" role="switch" aria-checked="true"
+          title="Keeps a draft of your edits in this browser every 10 seconds">
+          <span class="as-track"><span class="as-knob"></span></span>Auto-save
+        </button>
+        <span class="header-sep"></span>
+        <button type="button" class="hbtn" id="changeFileBtn" title="Close file">Close</button>
+        <div class="menu-wrap export-wrap">
+          <button type="button" class="hbtn hbtn-primary" id="exportBtn" aria-haspopup="dialog" aria-expanded="false" aria-controls="exportPanel" title="Export (E)">
+            <svg class="ic" width="16" height="16"><use href="#i-download"/></svg>
+            <span id="exportBtnLabel">Export</span>
+            <svg class="ic tool-caret" width="14" height="14"><use href="#i-chev-down"/></svg>
+          </button>
+          <div class="export hidden" id="exportPanel" role="dialog" aria-label="Export">
+            <!-- Form state -->
+            <div class="export-view" id="exportForm">
+              <div class="export-head">
+                <h2>Export</h2>
+                <span class="muted" id="exportSub">Choose how to save your pages.</span>
+              </div>
+
+              <div class="modes" role="radiogroup" aria-label="Save mode">
+                <label class="mode-card" id="modeKeepCard">
+                  <input type="radio" name="mode" value="keep" id="modeKeep" />
+                  <span class="mode-copy">
+                    <span class="mode-title">Keep quality</span>
+                    <span class="mode-desc">Saves edits as-is. Text stays selectable.<span id="keepEstimate"></span></span>
+                  </span>
+                </label>
+                <label class="mode-card" id="modeCompressCard">
+                  <input type="radio" name="mode" value="compress" id="modeCompress" checked />
+                  <span class="mode-copy">
+                    <span class="mode-title">Compress to a size</span>
+                    <span class="mode-desc">Best quality that fits your limit. Pages become images.</span>
+                  </span>
+                </label>
+              </div>
+
+              <div class="size-block" id="sizeBlock">
+                <span class="field-label" id="sizeLabel">Size limit</span>
+                <div class="size-row">
+                  <label class="size-input">
+                    <span class="sr-only">Target size</span>
+                    <input type="number" id="size" min="1" step="1" value="500" aria-labelledby="sizeLabel" />
+                  </label>
+                  <div class="seg" role="radiogroup" aria-label="Unit">
+                    <button type="button" class="seg-btn" data-unit="KB" aria-pressed="true">KB</button>
+                    <button type="button" class="seg-btn" data-unit="MB" aria-pressed="false">MB</button>
+                  </div>
+                </div>
+                <div class="chips" id="sizeChips">
+                  <button type="button" class="chip" data-kb="200">200 KB</button>
+                  <button type="button" class="chip" data-kb="500">500 KB</button>
+                  <button type="button" class="chip" data-kb="1024">1 MB</button>
+                  <button type="button" class="chip" data-kb="2048">2 MB</button>
+                </div>
+              </div>
+
+              <div class="note note-warn hidden" id="underLimitNote">
+                <svg class="ic" width="18" height="18"><use href="#i-info"/></svg>
+                <span id="underLimitText"></span>
+              </div>
+
+              <div class="note note-err hidden" id="formError" role="alert"></div>
+
+              <button type="button" class="btn btn-primary btn-xl" id="submit">
+                <svg class="ic" width="18" height="18"><use href="#i-download"/></svg>
+                <span id="submitLabel">Compress &amp; download</span>
+              </button>
+
+              <div class="privacy">
+                <svg class="ic ic-ok" width="14" height="14"><use href="#i-lock"/></svg>
+                Processed on this device. Saved to Downloads.
+              </div>
+            </div>
+
+            <!-- Working state -->
+            <div class="export-view hidden" id="exportWorking">
+              <h2 id="workingTitle">Compressing…</h2>
+              <div class="work-progress">
+                <div class="work-row"><span id="workPreset">Starting…</span><span id="workPage"></span></div>
+                <div class="bar" role="progressbar" aria-label="Compression progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progress">
+                  <div class="bar-fill" id="progressFill"></div>
+                </div>
+              </div>
+              <div class="ladder" id="ladder"></div>
+              <p class="muted small" id="workHint">We step down quality until the file fits. Large documents can take a minute.</p>
+              <button type="button" class="btn btn-outline btn-xl push-down" id="cancelBtn">Cancel</button>
+            </div>
+
+            <!-- Result state (filled by JS) -->
+            <div class="export-view hidden" id="result"></div>
+
+            <div class="export-foot">
+              <a class="support-link" href="https://www.buymeacoffee.com/anamsimon" target="_blank" rel="noopener">
+                <svg class="ic ic-accent" width="16" height="16"><use href="#i-coffee"/></svg>
+                Enjoying PDF Smith? Buy me a coffee</a>
+            </div>
+          </div>
+        </div>
       </div>
     </header>
 
@@ -204,99 +316,6 @@
         </div>
       </section>
 
-      <aside class="export" id="exportPanel" aria-label="Export">
-        <div class="rail" id="exportRail">
-          <button type="button" class="panel-toggle" id="exportExpandBtn" aria-controls="exportPanel" aria-expanded="false" aria-label="Show export (])" title="Show export (])">
-            <svg class="ic" width="18" height="18"><use href="#i-panel-left"/></svg></button>
-          <button type="button" class="rail-label" id="exportRailLabel" tabindex="-1">EXPORT</button>
-        </div>
-        <button type="button" class="panel-toggle export-collapse" id="exportCollapseBtn" aria-controls="exportPanel" aria-expanded="true" aria-label="Hide export (])" title="Hide export (])">
-          <svg class="ic" width="18" height="18"><use href="#i-panel-right"/></svg></button>
-        <!-- Form state -->
-        <div class="export-view" id="exportForm">
-          <div class="export-head">
-            <h2>Export</h2>
-            <span class="muted" id="exportSub">Choose how to save your pages.</span>
-          </div>
-
-          <div class="modes" role="radiogroup" aria-label="Save mode">
-            <label class="mode-card" id="modeKeepCard">
-              <input type="radio" name="mode" value="keep" id="modeKeep" />
-              <span class="mode-copy">
-                <span class="mode-title">Keep quality</span>
-                <span class="mode-desc">Saves edits as-is. Text stays selectable.<span id="keepEstimate"></span></span>
-              </span>
-            </label>
-            <label class="mode-card" id="modeCompressCard">
-              <input type="radio" name="mode" value="compress" id="modeCompress" checked />
-              <span class="mode-copy">
-                <span class="mode-title">Compress to a size</span>
-                <span class="mode-desc">Best quality that fits your limit. Pages become images.</span>
-              </span>
-            </label>
-          </div>
-
-          <div class="size-block" id="sizeBlock">
-            <span class="field-label" id="sizeLabel">Size limit</span>
-            <div class="size-row">
-              <label class="size-input">
-                <span class="sr-only">Target size</span>
-                <input type="number" id="size" min="1" step="1" value="500" aria-labelledby="sizeLabel" />
-              </label>
-              <div class="seg" role="radiogroup" aria-label="Unit">
-                <button type="button" class="seg-btn" data-unit="KB" aria-pressed="true">KB</button>
-                <button type="button" class="seg-btn" data-unit="MB" aria-pressed="false">MB</button>
-              </div>
-            </div>
-            <div class="chips" id="sizeChips">
-              <button type="button" class="chip" data-kb="200">200 KB</button>
-              <button type="button" class="chip" data-kb="500">500 KB</button>
-              <button type="button" class="chip" data-kb="1024">1 MB</button>
-              <button type="button" class="chip" data-kb="2048">2 MB</button>
-            </div>
-          </div>
-
-          <div class="note note-warn hidden" id="underLimitNote">
-            <svg class="ic" width="18" height="18"><use href="#i-info"/></svg>
-            <span id="underLimitText"></span>
-          </div>
-
-          <div class="note note-err hidden" id="formError" role="alert"></div>
-
-          <button type="button" class="btn btn-primary btn-xl" id="submit">
-            <svg class="ic" width="18" height="18"><use href="#i-download"/></svg>
-            <span id="submitLabel">Compress &amp; download</span>
-          </button>
-
-          <div class="privacy">
-            <svg class="ic ic-ok" width="14" height="14"><use href="#i-lock"/></svg>
-            Processed on this device. Saved to Downloads.
-          </div>
-        </div>
-
-        <!-- Working state -->
-        <div class="export-view hidden" id="exportWorking">
-          <h2 id="workingTitle">Compressing…</h2>
-          <div class="work-progress">
-            <div class="work-row"><span id="workPreset">Starting…</span><span id="workPage"></span></div>
-            <div class="bar" role="progressbar" aria-label="Compression progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progress">
-              <div class="bar-fill" id="progressFill"></div>
-            </div>
-          </div>
-          <div class="ladder" id="ladder"></div>
-          <p class="muted small" id="workHint">We step down quality until the file fits. Large documents can take a minute.</p>
-          <button type="button" class="btn btn-outline btn-xl push-down" id="cancelBtn">Cancel</button>
-        </div>
-
-        <!-- Result state (filled by JS) -->
-        <div class="export-view hidden" id="result"></div>
-
-        <div class="export-foot">
-          <a class="support-link" href="https://www.buymeacoffee.com/anamsimon" target="_blank" rel="noopener">
-            <svg class="ic ic-accent" width="16" height="16"><use href="#i-coffee"/></svg>
-            Enjoying PDF Smith? Buy me a coffee</a>
-        </div>
-      </aside>
     </div>
   </div>
 

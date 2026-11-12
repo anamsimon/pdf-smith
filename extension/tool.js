@@ -24,8 +24,7 @@ const insertMenu       = $('insertMenu');
 const insertMenuLabel  = $('insertMenuLabel');
 const undoBtn          = $('undoBtn');
 const redoBtn          = $('redoBtn');
-const shapesMenuBtn    = $('shapesMenuBtn');
-const shapesMenu       = $('shapesMenu');
+const shapeToolBtns    = document.querySelectorAll('#shapeTools [data-shape]');
 const shapeBar         = $('shapeBar');
 const spStroke         = $('spStroke');
 const spStrokeSwatch   = $('spStrokeSwatch');
@@ -262,8 +261,8 @@ document.addEventListener('keydown', (e) => {
   const inField = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (t && t.isContentEditable);
 
   if (e.key === 'Escape') {
+    if (exportOpen()) { closeExport(); exportBtn.focus(); return; }
     if (!insertMenu.classList.contains('hidden')) { closeInsertMenu(); insertMenuBtn.focus(); return; }
-    if (!shapesMenu.classList.contains('hidden')) { closeShapesMenu(); shapesMenuBtn.focus(); return; }
     if (shapeDrag) return;
     if (activeShape) { deselectShape(); return; }
     if (shapeTool) { setShapeTool(null); return; }
@@ -282,7 +281,7 @@ document.addEventListener('keydown', (e) => {
   if (e.altKey) return;
 
   if (e.key === '[') { e.preventDefault(); togglePanel('pages'); return; }
-  if (e.key === ']') { e.preventDefault(); togglePanel('export'); return; }
+  if (e.key.toLowerCase() === 'e') { e.preventDefault(); toggleExport(); return; }
 
   // Only act on selected text when focus isn't on another control (a focused
   // button should still respond to Enter, for example).
@@ -339,7 +338,7 @@ function setShapeTool(kind) {
 
 function updateModeUI() {
   textModeBtn.setAttribute('aria-pressed', String(textMode));
-  shapesMenuBtn.setAttribute('aria-pressed', String(!!shapeTool));
+  shapeToolBtns.forEach(b => b.setAttribute('aria-pressed', String(b.dataset.shape === shapeTool)));
   selectModeBtn.setAttribute('aria-pressed', String(!textMode && !shapeTool));
   viewer.classList.toggle('text-mode', textMode);
   viewer.classList.toggle('shape-mode', !!shapeTool);
@@ -358,6 +357,7 @@ selectModeBtn.addEventListener('click', () => { setShapeTool(null); setTextMode(
 textModeBtn.addEventListener('click', () => setTextMode(!textMode));
 
 function openInsertMenu() {
+  closeExport();
   insertMenuLabel.textContent = pageOrder.length ? `After page ${currentIndex() + 1}` : 'At the end';
   insertMenu.classList.remove('hidden');
   insertMenuBtn.setAttribute('aria-expanded', 'true');
@@ -370,28 +370,11 @@ function closeInsertMenu() {
 }
 insertMenuBtn.addEventListener('click', (e) => {
   e.stopPropagation();
-  closeShapesMenu();
   if (insertMenu.classList.contains('hidden')) openInsertMenu(); else closeInsertMenu();
 });
 
-function openShapesMenu() {
-  shapesMenu.classList.remove('hidden');
-  shapesMenuBtn.setAttribute('aria-expanded', 'true');
-  const current = shapesMenu.querySelector(`[data-shape="${shapeTool}"]`) || shapesMenu.querySelector('.menu-item');
-  if (current) current.focus();
-}
-function closeShapesMenu() {
-  shapesMenu.classList.add('hidden');
-  shapesMenuBtn.setAttribute('aria-expanded', 'false');
-}
-shapesMenuBtn.addEventListener('click', (e) => {
-  e.stopPropagation();
-  closeInsertMenu();
-  if (shapesMenu.classList.contains('hidden')) openShapesMenu(); else closeShapesMenu();
-});
-shapesMenu.querySelectorAll('[data-shape]').forEach(item => item.addEventListener('click', () => {
-  closeShapesMenu();
-  setShapeTool(item.dataset.shape);
+shapeToolBtns.forEach(btn => btn.addEventListener('click', () => {
+  setShapeTool(shapeTool === btn.dataset.shape ? null : btn.dataset.shape);
 }));
 $('insertFileMenuItem').addEventListener('click', () => {
   closeInsertMenu();
@@ -402,7 +385,7 @@ $('insertBlankMenuItem').addEventListener('click', () => {
   insertBlankPage(pageOrder.length ? currentIndex() + 1 : 0);
 });
 document.addEventListener('click', (e) => {
-  if (!e.target.closest('.menu-wrap')) { closeInsertMenu(); closeShapesMenu(); }
+  if (!e.target.closest('.menu-wrap')) closeInsertMenu();
 });
 appendFileBtn.addEventListener('click', () => triggerInsert(pageOrder.length));
 
@@ -467,6 +450,10 @@ changeFileBtn.addEventListener('click', () => {
   if (busy) { toast('Wait for the export to finish, or cancel it first.'); return; }
   if (isDirty() && !confirm('Close this file? Your unsaved edits will be lost.')) return;
   finalizeActive();
+  closeExport();
+  clearDraft();
+  resetAutosaveSession();
+  if (!autosaveOn) setAutosaveStatus('Auto-save off');
   loadGeneration++;
   if (previewRenderObserver) { previewRenderObserver.disconnect(); previewRenderObserver = null; }
   zoomMode = 'width'; updateZoomUI();
@@ -594,6 +581,9 @@ async function handleFiles(files) {
   if (skipped.length) toast(`Skipped ${skipped.join(', ')} — only PDF, JPG and PNG files are supported.`);
   if (!valid.length) return;
   const gen = ++loadGeneration;
+  resetAutosaveSession();
+  if (autosaveOn) setAutosaveStatus('');
+  $('restoreCard').classList.add('hidden');
 
   currentFile = valid[0].file;
   headerTitle.textContent = valid.length === 1 ? valid[0].file.name : `${valid[0].file.name} + ${valid.length - 1} more`;
@@ -2109,12 +2099,392 @@ function endShapeDrag(e) {
 previewEl.addEventListener('pointerup', endShapeDrag);
 previewEl.addEventListener('pointercancel', endShapeDrag);
 
+
+// ---- Swatch color picker -----------------------------------------------------
+// Each style-bar color button opens a palette of preset swatches; "Custom…"
+// still reaches the system picker. The hidden <input type=color> stays the
+// source of truth, so existing 'input' handlers keep working unchanged.
+const SWATCHES = [
+  ['#000000', 'Black'], ['#4B5563', 'Gray'], ['#9CA3AF', 'Light gray'], ['#FFFFFF', 'White'],
+  ['#92400E', 'Brown'], ['#DC2626', 'Red'], ['#EA580C', 'Orange'], ['#F59E0B', 'Amber'],
+  ['#FDE047', 'Yellow'], ['#FEF08A', 'Highlight yellow'], ['#16A34A', 'Green'], ['#0D9488', 'Teal'],
+  ['#2563EB', 'Blue'], ['#4F46E5', 'Indigo'], ['#9333EA', 'Purple'], ['#DB2777', 'Pink'],
+];
+let openSwatch = null; // { pop, trigger }
+
+function closeSwatchPicker(refocus) {
+  if (!openSwatch) return;
+  const { pop, trigger } = openSwatch;
+  openSwatch = null;
+  pop.remove();
+  trigger.setAttribute('aria-expanded', 'false');
+  if (refocus) trigger.focus();
+}
+
+function openSwatchPicker(trigger, input, getCurrent) {
+  closeSwatchPicker();
+  const bar = trigger.closest('.style-bar');
+  const current = (getCurrent ? getCurrent() : input.value) || '';
+  const pop = document.createElement('div');
+  pop.className = 'swatch-pop';
+  pop.setAttribute('role', 'dialog');
+  pop.setAttribute('aria-label', trigger.title || 'Color');
+  const grid = document.createElement('div');
+  grid.className = 'swatch-grid';
+  grid.setAttribute('role', 'radiogroup');
+  const choose = (hex) => {
+    closeSwatchPicker(false);
+    input.value = hex.toLowerCase();
+    // The style handler puts the caret back into text being edited;
+    // otherwise return focus to the color button.
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    if (activeAnn && activeAnn.editing) {
+      const el = activeEl();
+      if (el) {
+        el.focus();
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        range.collapse(false);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+      }
+    } else trigger.focus();
+  };
+  for (const [hex, name] of SWATCHES) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'swatch';
+    b.style.background = hex;
+    b.setAttribute('role', 'radio');
+    b.setAttribute('aria-label', name);
+    b.title = name;
+    const on = current.toLowerCase() === hex.toLowerCase();
+    b.setAttribute('aria-checked', String(on));
+    // Contrasting check mark
+    const n = parseInt(hex.slice(1), 16);
+    const light = ((n >> 16) * 299 + ((n >> 8) & 255) * 587 + (n & 255) * 114) / 1000 > 150;
+    b.innerHTML = `<svg class="ic" width="14" height="14" stroke-width="3" style="color:${light ? '#17181C' : '#fff'}"><use href="#i-check"/></svg>`;
+    b.addEventListener('click', () => choose(hex));
+    grid.appendChild(b);
+  }
+  pop.appendChild(grid);
+
+  const row = document.createElement('div');
+  row.className = 'swatch-custom-row';
+  const custom = document.createElement('button');
+  custom.type = 'button';
+  custom.className = 'swatch-custom';
+  custom.innerHTML = '<span class="swatch-rainbow"></span>Custom…';
+  custom.addEventListener('click', () => {
+    closeSwatchPicker(false);
+    try { input.showPicker(); } catch { input.click(); }
+  });
+  row.appendChild(custom);
+  const cur = document.createElement('span');
+  cur.className = 'swatch-current';
+  cur.textContent = current || 'None';
+  row.appendChild(cur);
+  pop.appendChild(row);
+
+  // Keyboard: arrows move between swatches, Esc closes.
+  pop.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeSwatchPicker(true); return; }
+    const btns = Array.from(grid.querySelectorAll('.swatch'));
+    const i = btns.indexOf(document.activeElement);
+    if (i < 0) return;
+    const step = { ArrowRight: 1, ArrowLeft: -1, ArrowDown: 8, ArrowUp: -8 }[e.key];
+    if (step) { e.preventDefault(); e.stopPropagation(); btns[(i + step + btns.length) % btns.length].focus(); }
+  });
+
+  bar.appendChild(pop);
+  // Below the bar by default; above it if that would leave the viewport.
+  pop.style.left = Math.max(0, Math.min(trigger.offsetLeft - 8, bar.clientWidth - pop.offsetWidth)) + 'px';
+  const barRect = bar.getBoundingClientRect();
+  if (barRect.bottom + pop.offsetHeight + 12 > window.innerHeight) pop.style.bottom = 'calc(100% + 8px)';
+  else pop.style.top = 'calc(100% + 8px)';
+  trigger.setAttribute('aria-expanded', 'true');
+  openSwatch = { pop, trigger };
+  (grid.querySelector('[aria-checked="true"]') || grid.querySelector('.swatch')).focus();
+}
+
+function attachSwatchPicker(input, getCurrent) {
+  const trigger = input.closest('.sb-color');
+  trigger.setAttribute('role', 'button');
+  trigger.setAttribute('aria-haspopup', 'dialog');
+  trigger.setAttribute('aria-expanded', 'false');
+  trigger.tabIndex = 0;
+  input.tabIndex = -1;
+  const toggle = (e) => {
+    e.preventDefault(); // stop the label from opening the system picker
+    if (openSwatch && openSwatch.trigger === trigger) closeSwatchPicker(true);
+    else openSwatchPicker(trigger, input, getCurrent);
+  };
+  trigger.addEventListener('click', (e) => { if (!e.target.closest('.swatch-pop')) toggle(e); });
+  trigger.addEventListener('keydown', (e) => {
+    if ((e.key === 'Enter' || e.key === ' ') && !e.target.closest('.swatch-pop')) toggle(e);
+  });
+}
+
+attachSwatchPicker(tpColor);
+attachSwatchPicker(spStroke);
+attachSwatchPicker(spFill, () => (spNoFill.getAttribute('aria-pressed') === 'true' ? '' : spFill.value));
+
+// Close on outside clicks, and whenever its bar hides or moves.
+document.addEventListener('pointerdown', (e) => {
+  if (openSwatch && !e.target.closest('.swatch-pop, .sb-color')) closeSwatchPicker(false);
+}, true);
+new MutationObserver(() => {
+  if (openSwatch && (openSwatch.trigger.closest('.style-bar.hidden') || !openSwatch.trigger.isConnected)) closeSwatchPicker(false);
+}).observe(document.body, { subtree: true, attributes: true, attributeFilter: ['class'] });
+
+
+// ---- Auto-save (session draft in IndexedDB) ----------------------------------
+// Every 10 s, if there are unexported edits, the session (page order, rotations,
+// text, shapes and source files) is stored in this browser. Source bytes are
+// written once per document; only the small page state is rewritten.
+const AUTOSAVE_MS = 10000;
+const AUTOSAVE_KEY = 'pdfsmith.autosave';
+const autosaveBtn = $('autosaveBtn');
+const autosaveStatus = $('autosaveStatus');
+let autosaveOn = true;
+let autosaveSession = null;     // id of the draft this session writes
+let savedDocEntries = [];       // docs[i] objects already stored for this session
+let lastAutosaveSig = null;
+let autosaveRunning = false;
+let dbPromise = null;
+
+function idb() {
+  if (!dbPromise) {
+    dbPromise = new Promise((resolve, reject) => {
+      const req = indexedDB.open('pdfsmith', 1);
+      req.onupgradeneeded = () => {
+        req.result.createObjectStore('draft');
+        req.result.createObjectStore('docs');
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    dbPromise.catch(() => { dbPromise = null; });
+  }
+  return dbPromise;
+}
+
+// Run fn(stores) in one transaction; resolves with fn's request result.
+async function idbTx(storeNames, mode, fn) {
+  const db = await idb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeNames, mode);
+    const stores = Object.fromEntries([].concat(storeNames).map(n => [n, tx.objectStore(n)]));
+    const req = fn(stores);
+    tx.oncomplete = () => resolve(req ? req.result : undefined);
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+}
+
+const getDraft = () => idbTx('draft', 'readonly', s => s.draft.get('current'));
+
+async function clearDraft() {
+  lastAutosaveSig = null;
+  try { await idbTx(['draft', 'docs'], 'readwrite', s => { s.draft.clear(); s.docs.clear(); }); } catch {}
+}
+
+function resetAutosaveSession() {
+  autosaveSession = null;
+  savedDocEntries = [];
+  lastAutosaveSig = null;
+  setAutosaveStatus('');
+}
+
+function setAutosaveStatus(text, isErr) {
+  autosaveStatus.textContent = text;
+  autosaveStatus.classList.toggle('err', !!isErr);
+}
+
+function autosaveSignature() {
+  return JSON.stringify([pageOrder, docs.length, headerTitle.textContent]);
+}
+
+async function autosaveTick() {
+  if (!autosaveOn || autosaveRunning || !docs[0] || viewer.classList.contains('hidden')) return;
+  autosaveRunning = true;
+  try {
+    if (!isDirty()) {
+      // Nothing unexported left to protect.
+      if (lastAutosaveSig !== 'clean') { await clearDraft(); lastAutosaveSig = 'clean'; savedDocEntries = []; autosaveSession = null; }
+      return;
+    }
+    const sig = autosaveSignature();
+    if (sig === lastAutosaveSig) return;
+    const fresh = !autosaveSession;
+    if (fresh) autosaveSession = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    const sessionId = autosaveSession;
+    const toWrite = [];
+    docs.forEach((d, i) => { if (d && savedDocEntries[i] !== d) toWrite.push([i, d]); });
+    const draft = {
+      sessionId,
+      savedAt: Date.now(),
+      title: headerTitle.textContent,
+      fileName: currentFile ? currentFile.name : (docs[0].name || 'document.pdf'),
+      fileType: currentFile ? currentFile.type : 'application/pdf',
+      pageOrder: clonePageOrder(),
+      originalPageCount,
+      savedStateJSON,
+      nextAnnId,
+      docMeta: docs.map(d => (d ? { name: d.name, size: d.size } : null)),
+    };
+    await idbTx(['draft', 'docs'], 'readwrite', s => {
+      if (fresh) s.docs.clear(); // a new session replaces any older draft
+      for (const [i, d] of toWrite) s.docs.put(d.bytes, `${sessionId}:${i}`);
+      return s.draft.put(draft, 'current');
+    });
+    if (sessionId !== autosaveSession) return; // file closed or replaced meanwhile
+    for (const [i, d] of toWrite) savedDocEntries[i] = d;
+    lastAutosaveSig = sig;
+    const t = new Date(draft.savedAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    setAutosaveStatus(`Draft saved ${t}`);
+    autosaveBtn.title = `Draft saved in this browser at ${t}. Saves every 10 seconds.`;
+  } catch (err) {
+    console.warn('auto-save failed', err);
+    setAutosaveStatus(err && err.name === 'QuotaExceededError' ? 'Auto-save: not enough space' : 'Auto-save failed', true);
+  } finally {
+    autosaveRunning = false;
+  }
+}
+
+function setAutosave(on, { persist = true } = {}) {
+  autosaveOn = !!on;
+  autosaveBtn.setAttribute('aria-checked', String(autosaveOn));
+  if (persist) { try { localStorage.setItem(AUTOSAVE_KEY, autosaveOn ? '1' : '0'); } catch {} }
+  if (autosaveOn) { lastAutosaveSig = null; setAutosaveStatus(''); autosaveTick(); }
+  else { clearDraft(); resetAutosaveSession(); setAutosaveStatus('Auto-save off'); }
+}
+autosaveBtn.addEventListener('click', () => setAutosave(!autosaveOn));
+try { if (localStorage.getItem(AUTOSAVE_KEY) === '0') setAutosave(false, { persist: false }); } catch {}
+
+setInterval(autosaveTick, AUTOSAVE_MS);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') autosaveTick(); });
+
+function timeAgo(ms) {
+  const s = Math.round((Date.now() - ms) / 1000);
+  if (s < 60) return 'just now';
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m} min ago`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `${h} hr ago`;
+  return new Date(ms).toLocaleDateString([], { month: 'short', day: 'numeric' });
+}
+
+async function showRestoreCard() {
+  const card = $('restoreCard');
+  let d = null;
+  try { d = await getDraft(); } catch {}
+  if (!d || !d.pageOrder || !d.pageOrder.length || !viewer.classList.contains('hidden')) { card.classList.add('hidden'); return; }
+  const n = d.pageOrder.length;
+  $('restoreSub').textContent = `${d.title} · ${n} page${n === 1 ? '' : 's'} · edited ${timeAgo(d.savedAt)}`;
+  $('restoreSub').title = d.title;
+  card.classList.remove('hidden');
+}
+
+async function restoreDraft() {
+  let d;
+  try { d = await getDraft(); } catch {}
+  if (!d) { $('restoreCard').classList.add('hidden'); return; }
+  const gen = ++loadGeneration;
+  $('restoreCard').classList.add('hidden');
+  zoomMode = 'width'; updateZoomUI();
+  setShapeTool(null); setTextMode(false);
+  lastResult = null;
+  showExportView('form');
+  uploader.classList.add('hidden');
+  viewer.classList.remove('hidden');
+  previewEl.innerHTML = '<div class="placeholder">Restoring your session…</div>';
+  try {
+    const entries = [];
+    for (let i = 0; i < d.docMeta.length; i++) {
+      const meta = d.docMeta[i];
+      const bytes = meta ? await idbTx('docs', 'readonly', s => s.docs.get(`${d.sessionId}:${i}`)) : null;
+      entries.push(bytes ? await loadDocFromBytes(bytes, meta.name, meta.size) : null);
+      if (isStale(gen)) return;
+    }
+    if (!entries[0]) throw new Error('the original file is missing from the draft');
+    docs.length = 0;
+    docs.push(...entries);
+    thumbCache.clear();
+    pageOrder = d.pageOrder.filter(r => docs[r.doc]);
+    originalPageCount = d.originalPageCount;
+    savedStateJSON = d.savedStateJSON;
+    let maxId = 0;
+    pageOrder.forEach(r => (r.annotations || []).forEach(a => { if (a.id > maxId) maxId = a.id; }));
+    nextAnnId = Math.max(d.nextAnnId || 1, maxId + 1);
+    currentFile = new File([docs[0].bytes], d.fileName, { type: d.fileType || 'application/pdf' });
+    headerTitle.textContent = d.title;
+    headerTitle.title = d.title;
+    document.title = `${d.fileName} — PDF Smith`;
+    clearHistory();
+    for (let i = 0; i < docs.length; i++) {
+      if (!docs[i]) continue;
+      await renderDocThumbnails(i, gen);
+      if (isStale(gen)) return;
+    }
+    // Keep writing to the same draft; its documents are already stored.
+    autosaveSession = d.sessionId;
+    savedDocEntries = docs.slice();
+    lastAutosaveSig = autosaveSignature();
+    currentRef = pageOrder[0] || null;
+    applyRestoredState();
+    updateThumbActive();
+    setAutosaveStatus(autosaveOn ? 'Draft restored' : 'Auto-save off');
+  } catch (err) {
+    if (isStale(gen)) return;
+    previewEl.innerHTML = `<div class="placeholder err">Couldn't restore the session: ${escapeHtml(err.message || String(err))}</div>`;
+  }
+}
+
+$('restoreDraftBtn').addEventListener('click', restoreDraft);
+$('discardDraftBtn').addEventListener('click', async () => {
+  await clearDraft();
+  $('restoreCard').classList.add('hidden');
+});
+showRestoreCard();
+
+// ---- Export popover ------------------------------------------------------------
+const exportBtn = $('exportBtn');
+const exportBtnLabel = $('exportBtnLabel');
+const exportPanel = $('exportPanel');
+function exportOpen() { return !exportPanel.classList.contains('hidden'); }
+function openExport() {
+  if (exportOpen()) return;
+  closeInsertMenu();
+  finalizeActive();
+  exportPanel.classList.remove('hidden');
+  exportBtn.setAttribute('aria-expanded', 'true');
+}
+function closeExport() {
+  if (!exportOpen()) return;
+  exportPanel.classList.add('hidden');
+  exportBtn.setAttribute('aria-expanded', 'false');
+}
+function toggleExport() {
+  if (exportOpen()) closeExport();
+  else {
+    openExport();
+    const first = exportPanel.querySelector('.export-view:not(.hidden) input:checked, .export-view:not(.hidden) button');
+    if (first) first.focus();
+  }
+}
+exportBtn.addEventListener('click', (e) => { e.stopPropagation(); toggleExport(); });
+// Click outside closes it (it keeps working in the background).
+document.addEventListener('pointerdown', (e) => {
+  if (exportOpen() && !e.target.closest('.export-wrap')) closeExport();
+}, true);
+
 // ---- Collapsible side panels -------------------------------------------------
 const edBody = document.querySelector('.ed-body');
 const PANEL_KEY = 'pdfsmith.collapsed';
 const panelUi = {
   pages:  { collapse: $('pagesCollapseBtn'),  expand: $('pagesExpandBtn'),  label: $('pagesRailLabel') },
-  export: { collapse: $('exportCollapseBtn'), expand: $('exportExpandBtn'), label: $('exportRailLabel') },
 };
 
 function isCollapsed(name) { return edBody.classList.contains(`${name}-collapsed`); }
@@ -2128,7 +2498,7 @@ function setPanelCollapsed(name, collapsed, { focus = false, persist = true } = 
   if (focus) (collapsed ? ui.expand : ui.collapse).focus();
   if (persist) {
     try {
-      localStorage.setItem(PANEL_KEY, JSON.stringify({ pages: isCollapsed('pages'), export: isCollapsed('export') }));
+      localStorage.setItem(PANEL_KEY, JSON.stringify({ pages: isCollapsed('pages') }));
     } catch (_) { /* storage unavailable */ }
   }
   refitAfterPanelChange();
@@ -2158,7 +2528,6 @@ try {
   const saved = JSON.parse(localStorage.getItem(PANEL_KEY) || 'null');
   if (saved) {
     if (saved.pages) setPanelCollapsed('pages', true, { persist: false });
-    if (saved.export) setPanelCollapsed('export', true, { persist: false });
   }
 } catch (_) { /* ignore bad or blocked storage */ }
 
@@ -2223,8 +2592,10 @@ function showExportView(which) {
   exportForm.classList.toggle('hidden', which !== 'form');
   exportWorking.classList.toggle('hidden', which !== 'working');
   result.classList.toggle('hidden', which !== 'result');
-  // Progress and results live in the export panel, so make sure it's visible.
-  if (which !== 'form') setPanelCollapsed('export', false, { persist: false });
+  // Progress and results live in the export popover, so make sure it's open.
+  exportBtn.classList.toggle('is-busy', which === 'working');
+  exportBtnLabel.textContent = which === 'working' ? 'Exporting…' : 'Export';
+  if (which !== 'form' && !viewer.classList.contains('hidden')) openExport();
 }
 
 function showFormError(msg) {
