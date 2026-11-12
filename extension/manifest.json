@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "PDF Smith",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Reorder, rotate, add text, merge, and compress PDFs to a target file size — entirely in your browser.",
   "action": {
     "default_title": "Open PDF Smith",
