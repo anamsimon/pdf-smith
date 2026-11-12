@@ -947,6 +947,17 @@ function rotatePageByKey(key) {
     r.rotation = newRot;
     // A 90° clockwise turn maps the anchor (x, y) to (1 - y, x).
     (r.annotations || []).forEach(a => {
+      if (a.type === 'shape' && a.shape === 'image') {
+        // Images stay upright: move the centre, keep the size in points.
+        const pa = a.pageAspect || 1;
+        const cx = (a.xFrac + a.x2Frac) / 2, cy = (a.yFrac + a.y2Frac) / 2;
+        const hw = Math.abs(a.x2Frac - a.xFrac) / 2 * pa, hh = Math.abs(a.y2Frac - a.yFrac) / 2 / pa;
+        const ncx = Math.max(hw, Math.min(1 - hw, 1 - cy)), ncy = Math.max(hh, Math.min(1 - hh, cx));
+        a.xFrac = ncx - hw; a.x2Frac = ncx + hw;
+        a.yFrac = ncy - hh; a.y2Frac = ncy + hh;
+        a.pageAspect = 1 / pa;
+        return;
+      }
       const x = a.xFrac, y = a.yFrac;
       a.xFrac = Math.max(0, Math.min(1, 1 - y));
       a.yFrac = Math.max(0, Math.min(1, x));
@@ -1680,7 +1691,7 @@ previewEl.addEventListener('pointercancel', endAnnotationDrag);
 function shapeGeometry(ann, W, H, s) {
   const x1 = ann.xFrac * W, y1 = ann.yFrac * H, x2 = ann.x2Frac * W, y2 = ann.y2Frac * H;
   const sw = (ann.strokeWidth || 0) * s;
-  if (ann.shape === 'rect') {
+  if (ann.shape === 'rect' || ann.shape === 'image') {
     const l = Math.min(x1, x2), r = Math.max(x1, x2), t = Math.min(y1, y2), b = Math.max(y1, y2);
     return { body: [['M', l, t], ['L', r, t], ['L', r, b], ['L', l, b], ['Z']], closed: true, head: null };
   }
@@ -1732,11 +1743,20 @@ function pathToD(cmds, map) {
 
 function shapeHasFill(ann) { return (ann.shape === 'rect' || ann.shape === 'ellipse') && !!ann.fill; }
 function shapeStrokeWidth(ann) {
+  if (ann.shape === 'image') return 0;
   // Lines and arrows always need an outline.
   return ann.shape === 'line' || ann.shape === 'arrow' ? Math.max(ann.strokeWidth || 0, 1) : (ann.strokeWidth || 0);
 }
 
 function drawShapeOnCanvas(ctx, ann, W, H, s) {
+  if (ann.shape === 'image') {
+    const im = placedImages.get(ann.imgId);
+    if (im) {
+      ctx.drawImage(im.el, Math.min(ann.xFrac, ann.x2Frac) * W, Math.min(ann.yFrac, ann.y2Frac) * H,
+        Math.abs(ann.x2Frac - ann.xFrac) * W, Math.abs(ann.y2Frac - ann.yFrac) * H);
+    }
+    return;
+  }
   const g = shapeGeometry(ann, W, H, s);
   const sw = shapeStrokeWidth(ann);
   ctx.save();
@@ -1809,6 +1829,14 @@ function renderShapeLayer(slot, idx) {
     const d = pathToD(g.body);
     const fillD = g.head ? d + ' ' + pathToD(g.head) : d;
     // Visible shape
+    if (ann.shape === 'image') {
+      const im = placedImages.get(ann.imgId);
+      if (im) group.appendChild(svgEl('image', {
+        href: im.url, class: 'shape-image', preserveAspectRatio: 'none',
+        x: Math.min(ann.xFrac, ann.x2Frac) * W, y: Math.min(ann.yFrac, ann.y2Frac) * H,
+        width: Math.abs(ann.x2Frac - ann.xFrac) * W, height: Math.abs(ann.y2Frac - ann.yFrac) * H,
+      }));
+    }
     if (shapeHasFill(ann)) group.appendChild(svgEl('path', { d, fill: ann.fill, stroke: 'none' }));
     if (sw > 0) group.appendChild(svgEl('path', { d, fill: 'none', stroke: ann.stroke, 'stroke-width': sw, 'stroke-linecap': 'round', 'stroke-linejoin': 'miter' }));
     if (g.head) group.appendChild(svgEl('path', { d: pathToD(g.head), fill: ann.stroke, stroke: 'none' }));
@@ -1901,6 +1929,9 @@ function deleteActiveShape() {
 }
 
 function loadShapeBar(ann) {
+  shapeBar.classList.toggle('is-image', ann.shape === 'image');
+  shapeBar.setAttribute('aria-label', ann.shape === 'image' ? 'Image' : 'Shape style');
+  spDelete.setAttribute('aria-label', ann.shape === 'image' ? 'Delete image' : 'Delete shape');
   spStroke.value = ann.stroke || '#000000';
   spStrokeSwatch.style.borderColor = spStroke.value;
   const fillable = ann.shape === 'rect' || ann.shape === 'ellipse';
@@ -2046,16 +2077,21 @@ previewEl.addEventListener('pointermove', (e) => {
     const ox = sd.mode === 'draw' ? 'xFrac' : (hx === 'xFrac' ? 'x2Frac' : 'xFrac');
     const oy = sd.mode === 'draw' ? 'yFrac' : (hy === 'yFrac' ? 'y2Frac' : 'yFrac');
     let px = fx, py = fy;
-    if (e.shiftKey) {
+    const isLine = ann.shape === 'line' || ann.shape === 'arrow';
+    // Images keep their proportions unless Shift is held; boxes become
+    // square with Shift; lines snap to 45° with Shift.
+    const lockRatio = ann.shape === 'image' ? !e.shiftKey : (e.shiftKey && !isLine);
+    if ((e.shiftKey && isLine) || lockRatio) {
       const ax = ann[ox] * rect.width, ay = ann[oy] * rect.height;
       let dxp = px * rect.width - ax, dyp = py * rect.height - ay;
-      if (ann.shape === 'line' || ann.shape === 'arrow') {
+      if (isLine) {
         const len = Math.hypot(dxp, dyp);
         const ang = Math.round(Math.atan2(dyp, dxp) / (Math.PI / 4)) * (Math.PI / 4);
         dxp = Math.cos(ang) * len; dyp = Math.sin(ang) * len;
       } else {
-        const m = Math.max(Math.abs(dxp), Math.abs(dyp));
-        dxp = Math.sign(dxp || 1) * m; dyp = Math.sign(dyp || 1) * m;
+        const r = ann.shape === 'image' ? (ann.ratio || 1) : 1;
+        const w = Math.max(Math.abs(dxp), Math.abs(dyp) * r);
+        dxp = Math.sign(dxp || 1) * w; dyp = Math.sign(dyp || 1) * w / r;
       }
       px = clamp01((ax + dxp) / rect.width);
       py = clamp01((ay + dyp) / rect.height);
@@ -2099,6 +2135,146 @@ function endShapeDrag(e) {
 previewEl.addEventListener('pointerup', endShapeDrag);
 previewEl.addEventListener('pointercancel', endShapeDrag);
 
+
+// ---- Images placed on pages (pasted or picked) --------------------------------
+// Stored as shapes ({ shape: 'image', imgId, ratio, pageAspect }) so selection,
+// moving, resizing, undo and auto-save all come for free. Pixel data lives in
+// this registry, keyed by id, so history snapshots stay small.
+const placedImages = new Map(); // id -> { bytes, mime, w, h, el, url }
+
+async function registerImage(bytes, mime, id) {
+  id = id || ('img' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7));
+  if (placedImages.has(id)) return id;
+  const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
+  const el = new Image();
+  el.src = url;
+  await el.decode();
+  placedImages.set(id, { bytes, mime, w: el.naturalWidth, h: el.naturalHeight, el, url });
+  return id;
+}
+
+// PNG and upright JPEG are kept as-is; anything else (WebP, GIF, rotated
+// JPEG) is redrawn by the browser as PNG so pdf-lib can embed it.
+async function normalizeImage(blob) {
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  if (blob.type === 'image/png') return { bytes, mime: 'image/png' };
+  if (blob.type === 'image/jpeg' && jpegOrientation(bytes) === 1) return { bytes, mime: 'image/jpeg' };
+  if (blob.type === 'image/jpeg') return { bytes: await redrawImage(blob, false), mime: 'image/jpeg' };
+  return { bytes: await redrawImage(blob, true), mime: 'image/png' };
+}
+
+async function placeImageBlob(blob, offsetSteps = 0) {
+  if (!pageOrder.length) return;
+  const idx = Math.max(0, currentIndex());
+  const ref = pageOrder[idx];
+  const slot = previewEl.querySelectorAll('.preview-page')[idx];
+  const canvas = slot && slot.querySelector('canvas');
+  if (!ref || !canvas) return;
+  let id;
+  try {
+    const { bytes, mime } = await normalizeImage(blob);
+    id = await registerImage(bytes, mime);
+  } catch (err) {
+    console.warn('image paste failed', err);
+    toast("Couldn't read that image.");
+    return;
+  }
+  const img = placedImages.get(id);
+  const rect = canvas.getBoundingClientRect();
+  const scale = slot._scale || rect.width / 612;
+  // Natural size at 96 dpi, capped to 60% of the page.
+  let wPx = img.w * 0.75 * scale, hPx = img.h * 0.75 * scale;
+  const k = Math.min(1, (rect.width * 0.6) / wPx, (rect.height * 0.6) / hPx);
+  wPx *= k; hPx *= k;
+  // Centre it in the part of the page that's on screen.
+  const pv = previewEl.getBoundingClientRect();
+  const visTop = Math.max(rect.top, pv.top), visBot = Math.min(rect.bottom, pv.bottom);
+  const cy = (visBot > visTop ? (visTop + visBot) / 2 : rect.top + rect.height / 2) - rect.top + offsetSteps * 24;
+  const cx = rect.width / 2 + offsetSteps * 24;
+  const wF = wPx / rect.width, hF = hPx / rect.height;
+  const x1 = Math.max(0, Math.min(1 - wF, (cx - wPx / 2) / rect.width));
+  const y1 = Math.max(0, Math.min(1 - hF, (cy - hPx / 2) / rect.height));
+
+  finalizeActive();
+  if (textMode || shapeTool) { setShapeTool(null); setTextMode(false); }
+  recordHistory();
+  if (!ref.annotations) ref.annotations = [];
+  const ann = {
+    id: nextAnnId++, type: 'shape', shape: 'image', imgId: id,
+    ratio: img.w / img.h, pageAspect: rect.width / rect.height,
+    xFrac: x1, yFrac: y1, x2Frac: x1 + wF, y2Frac: y1 + hF,
+    stroke: '#000000', strokeWidth: 0, fill: null,
+  };
+  ref.annotations.push(ann);
+  activeShape = null;
+  selectShape(idx, ann.id);
+  updateEditStatus();
+}
+
+// Map a point in the page's displayed frame (pt) to PDF user space.
+function displayToPdf(px, py, box, rot) {
+  const W = box.width, H = box.height;
+  const sideways = rot === 90 || rot === 270;
+  const u = px / (sideways ? H : W), v = py / (sideways ? W : H);
+  let X, Y;
+  if (rot === 90)       { X = v * W;       Y = u * H; }
+  else if (rot === 180) { X = (1 - u) * W; Y = v * H; }
+  else if (rot === 270) { X = (1 - v) * W; Y = (1 - u) * H; }
+  else                  { X = u * W;       Y = (1 - v) * H; }
+  return [box.x + X, box.y + Y];
+}
+
+async function pngBytesFromImage(el) {
+  const c = document.createElement('canvas');
+  c.width = el.naturalWidth; c.height = el.naturalHeight;
+  c.getContext('2d').drawImage(el, 0, 0);
+  const blob = await new Promise(r => c.toBlob(r, 'image/png'));
+  c.width = c.height = 0;
+  return new Uint8Array(await blob.arrayBuffer());
+}
+
+async function drawImageOnPdfPage(doc, pg, ann, box, rot, cache) {
+  const im = placedImages.get(ann.imgId);
+  if (!im) return;
+  let pdfImg = cache.get(ann.imgId);
+  if (!pdfImg) {
+    try { pdfImg = im.mime === 'image/png' ? await doc.embedPng(im.bytes) : await doc.embedJpg(im.bytes); }
+    catch { pdfImg = await doc.embedPng(await pngBytesFromImage(im.el)); }
+    cache.set(ann.imgId, pdfImg);
+  }
+  const sideways = rot === 90 || rot === 270;
+  const Wd = sideways ? box.height : box.width, Hd = sideways ? box.width : box.height;
+  const l = Math.min(ann.xFrac, ann.x2Frac) * Wd, t = Math.min(ann.yFrac, ann.y2Frac) * Hd;
+  const w = Math.abs(ann.x2Frac - ann.xFrac) * Wd, h = Math.abs(ann.y2Frac - ann.yFrac) * Hd;
+  // The image's own origin is its displayed bottom-left corner; rotating by
+  // the page rotation keeps it upright on screen.
+  const [x, y] = displayToPdf(l, t + h, box, rot);
+  pg.drawImage(pdfImg, { x, y, width: w, height: h, rotate: PDFLib.degrees(rot) });
+}
+
+document.addEventListener('paste', (e) => {
+  const t = e.target;
+  const tag = (t && t.tagName) || '';
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (t && t.isContentEditable)) return;
+  const files = Array.from((e.clipboardData && e.clipboardData.items) || [])
+    .filter(i => i.kind === 'file' && i.type.startsWith('image/'))
+    .map(i => i.getAsFile()).filter(Boolean);
+  if (!files.length) return;
+  e.preventDefault();
+  if (viewer.classList.contains('hidden')) { handleFiles(files); return; }
+  (async () => { for (let i = 0; i < files.length; i++) await placeImageBlob(files[i], i); })();
+});
+
+const placeImageInput = $('placeImageFile');
+$('placeImageMenuItem').addEventListener('click', () => {
+  closeInsertMenu();
+  placeImageInput.click();
+});
+placeImageInput.addEventListener('change', async () => {
+  const files = Array.from(placeImageInput.files || []);
+  placeImageInput.value = '';
+  for (let i = 0; i < files.length; i++) await placeImageBlob(files[i], i);
+});
 
 // ---- Swatch color picker -----------------------------------------------------
 // Each style-bar color button opens a palette of preset swatches; "Custom…"
@@ -2250,6 +2426,7 @@ const autosaveStatus = $('autosaveStatus');
 let autosaveOn = true;
 let autosaveSession = null;     // id of the draft this session writes
 let savedDocEntries = [];       // docs[i] objects already stored for this session
+let savedImageIds = new Set();  // placed images already stored for this session
 let lastAutosaveSig = null;
 let autosaveRunning = false;
 let dbPromise = null;
@@ -2293,6 +2470,7 @@ async function clearDraft() {
 function resetAutosaveSession() {
   autosaveSession = null;
   savedDocEntries = [];
+  savedImageIds = new Set();
   lastAutosaveSig = null;
   setAutosaveStatus('');
 }
@@ -2318,10 +2496,17 @@ async function autosaveTick() {
     const sig = autosaveSignature();
     if (sig === lastAutosaveSig) return;
     const fresh = !autosaveSession;
-    if (fresh) autosaveSession = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    if (fresh) {
+      autosaveSession = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+      savedDocEntries = [];
+      savedImageIds = new Set();
+    }
     const sessionId = autosaveSession;
     const toWrite = [];
     docs.forEach((d, i) => { if (d && savedDocEntries[i] !== d) toWrite.push([i, d]); });
+    const imageIds = [...new Set(pageOrder.flatMap(r => (r.annotations || []).filter(a => a.imgId).map(a => a.imgId)))]
+      .filter(id => placedImages.has(id));
+    const imgsToWrite = imageIds.filter(id => !savedImageIds.has(id));
     const draft = {
       sessionId,
       savedAt: Date.now(),
@@ -2333,14 +2518,20 @@ async function autosaveTick() {
       savedStateJSON,
       nextAnnId,
       docMeta: docs.map(d => (d ? { name: d.name, size: d.size } : null)),
+      imageIds,
     };
     await idbTx(['draft', 'docs'], 'readwrite', s => {
       if (fresh) s.docs.clear(); // a new session replaces any older draft
       for (const [i, d] of toWrite) s.docs.put(d.bytes, `${sessionId}:${i}`);
+      for (const id of imgsToWrite) {
+        const im = placedImages.get(id);
+        s.docs.put({ bytes: im.bytes, mime: im.mime }, `${sessionId}:img:${id}`);
+      }
       return s.draft.put(draft, 'current');
     });
     if (sessionId !== autosaveSession) return; // file closed or replaced meanwhile
     for (const [i, d] of toWrite) savedDocEntries[i] = d;
+    imgsToWrite.forEach(id => savedImageIds.add(id));
     lastAutosaveSig = sig;
     const t = new Date(draft.savedAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
     setAutosaveStatus(`Draft saved ${t}`);
@@ -2409,6 +2600,11 @@ async function restoreDraft() {
       if (isStale(gen)) return;
     }
     if (!entries[0]) throw new Error('the original file is missing from the draft');
+    for (const id of d.imageIds || []) {
+      const rec = await idbTx('docs', 'readonly', s => s.docs.get(`${d.sessionId}:img:${id}`));
+      if (rec) { try { await registerImage(rec.bytes, rec.mime, id); } catch {} }
+      if (isStale(gen)) return;
+    }
     docs.length = 0;
     docs.push(...entries);
     thumbCache.clear();
@@ -2431,6 +2627,7 @@ async function restoreDraft() {
     // Keep writing to the same draft; its documents are already stored.
     autosaveSession = d.sessionId;
     savedDocEntries = docs.slice();
+    savedImageIds = new Set((d.imageIds || []).filter(id => placedImages.has(id)));
     lastAutosaveSig = autosaveSignature();
     currentRef = pageOrder[0] || null;
     applyRestoredState();
@@ -3023,6 +3220,7 @@ async function buildReorganizedPdfBytes(order) {
   // Embed text annotations
   if (order.some(r => r.annotations && r.annotations.some(a => a.text || a.type === 'shape'))) {
     const fontCache = new Map();
+    const imgCache = new Map();
     const getFont = async (family, bold, italic) => {
       const key = `${family}_${bold}_${italic}`;
       if (!fontCache.has(key)) fontCache.set(key, await newDoc.embedFont(resolveStandardFont(family, bold, italic)));
@@ -3038,7 +3236,10 @@ async function buildReorganizedPdfBytes(order) {
       const rot = ((pg.getRotation().angle % 360) + 360) % 360;
       for (const ann of anns) {
         if (ann.type === 'shape') {
-          try { drawShapeOnPdfPage(pg, ann, box, rot); } catch (e) { console.warn('shape draw error', e); }
+          try {
+            if (ann.shape === 'image') await drawImageOnPdfPage(newDoc, pg, ann, box, rot, imgCache);
+            else drawShapeOnPdfPage(pg, ann, box, rot);
+          } catch (e) { console.warn('shape draw error', e); }
           continue;
         }
         if (ann.type !== 'text' || !ann.text) continue;

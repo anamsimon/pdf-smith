@@ -660,6 +660,10 @@ a:hover { color: var(--accent-hover); }
   background: linear-gradient(to top right, transparent 44%, #EF4444 44%, #EF4444 56%, transparent 56%), #fff !important;
 }
 .sp-fill { display: inline-flex; align-items: center; gap: 4px; }
+#shapeBar.is-image #spStrokeGroup,
+#shapeBar.is-image #spFillGroup,
+#shapeBar.is-image .sp-last-sep { display: none; }
+.shape-image { pointer-events: none; }
 .sb-nofill { color: #fff; }
 .menu-item kbd {
   margin-left: auto;
