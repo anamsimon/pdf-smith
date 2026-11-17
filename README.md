@@ -20,7 +20,7 @@ The `extension/` directory holds the Chrome extension. The original Flask app (`
 ## Install (unpacked)
 
 1. Clone or download this repo.
-2. Open `chrome://extensions` in Chrome (or another Chromium-based browser).
+2. Open `chrome://extensions` in Chrome 116 or later (or another Chromium-based browser).
 3. Toggle **Developer mode** on (top right).
 4. Click **Load unpacked** and pick the `extension/` directory inside this repo.
 5. Pin the **PDF Smith** action in the toolbar (puzzle-piece menu → pin) and click it to open the tool in a new tab.
@@ -42,7 +42,7 @@ All scripts (PDF.js, pdf-lib) and fonts are bundled under `extension/vendor/`, s
 ## Architecture
 
 - **`extension/manifest.json`** — Manifest V3. Declares the action button, a service-worker background script, and the `downloads` permission.
-- **`extension/background.js`** — opens `tool.html` in a new tab when the toolbar icon is clicked (re-focuses an existing tab if one is already open).
+- **`extension/background.js`** — opens `tool.html` in a new tab when the toolbar icon is clicked, or switches to it if it's already open (found with `chrome.runtime.getContexts`, so no `tabs` permission is needed).
 - **`extension/tool.html` / `tool.css` / `tool.js`** — the single-page UI. Edit state (`pageOrder` with per-page rotation and text annotations, undo history, current page, loaded documents) lives in JS; original bytes for each loaded PDF are kept in memory and re-fed to pdf-lib when saving.
 - **`extension/vendor/`** — bundled `pdf.min.js`, `pdf.worker.min.js`, `pdf-lib.min.js`. Loaded from `chrome.runtime.getURL()` so the page works under the default MV3 CSP, which forbids remote scripts.
 - **`extension/fonts/`** — bundled Inter and Space Grotesk (variable WOFF2, SIL Open Font License; license files alongside) used by the UI, so no font requests leave the browser.
@@ -52,6 +52,16 @@ All scripts (PDF.js, pdf-lib) and fonts are bundled under `extension/vendor/`, s
 Because Chrome extensions can't write directly to disk, output files are saved via `chrome.downloads.download()`. On Windows this attaches a `Zone.Identifier` Mark-of-the-Web (MOTW) tag to saved files, which makes Explorer's preview pane refuse to render them with *"The file you are attempting to preview could harm your computer."*
 
 If avoiding MOTW matters, use the legacy Flask app instead — its Python process writes the bytes directly to disk and skips the tag.
+
+## Publishing to the Chrome Web Store
+
+1. Build the upload package: `python scripts/package.py` → `dist/pdf-smith-<version>.zip` (`dist/` is git-ignored). It zips `extension/` with `manifest.json` at the root, skips draft files like `icons/logo-*`, and stops if a file named in the manifest is missing.
+2. Fill in the listing from [`store/LISTING.md`](store/LISTING.md): descriptions, category, privacy-tab answers and permission justification.
+3. Upload the graphics from `store/screenshots/` (1280×800) and `store/promo/` (440×280 small tile, 1400×560 marquee), plus `extension/icons/icon-128.png`.
+4. Privacy policy URL: [`PRIVACY.md`](PRIVACY.md) on GitHub. It needs to be pushed before you submit.
+5. Bump `version` in `extension/manifest.json` for every update you upload.
+
+`extension/vendor/README.md` records the exact PDF.js and pdf-lib releases (with SHA-256 hashes), in case review asks about the minified files.
 
 ## Compression preset ladder
 

@@ -1029,6 +1029,13 @@ a:hover { color: var(--accent-hover); }
 }
 
 /* ---------- Responsive ---------- */
+/* Short laptop screens: keep the feature cards above the fold. */
+@media (max-height: 860px) {
+  .start-header { padding-top: 14px; padding-bottom: 14px; }
+  .start-main { padding-top: 40px; padding-bottom: 32px; gap: 28px; }
+  .drop { padding: 36px 24px; gap: 14px; }
+  .drop-icon { width: 60px; height: 60px; }
+}
 @media (max-width: 1180px) {
   .ed-body { --pages-w: 220px; }
   .autosave-status { display: none; }
