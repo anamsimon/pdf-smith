@@ -10,9 +10,9 @@ Upload `dist/pdf-smith-1.1.0.zip`.
 
 **Name** (from the manifest): PDF Smith
 
-**Short description** (from the manifest, 101 of 132 characters):
+**Short description** (from the manifest, 118 of 132 characters):
 
-> Reorder, rotate, add text, merge, and compress PDFs to a target file size — entirely in your browser.
+> Secure, offline PDF editor. Reorder, rotate, add text, merge and compress PDFs to a target size — nothing is uploaded.
 
 **Category:** Productivity › Tools
 
@@ -21,7 +21,7 @@ Upload `dist/pdf-smith-1.1.0.zip`.
 **Detailed description:**
 
 ```
-PDF Smith fixes up PDFs without uploading them anywhere. Open a PDF (or a JPG or PNG), make your changes, and save — everything happens inside your browser.
+PDF Smith is a secure, offline PDF editor: your files never leave your computer. Open a PDF (or a JPG or PNG), make your changes, and save — everything happens inside your browser.
 
 ORGANIZE PAGES
 • Drag thumbnails to reorder pages
@@ -62,7 +62,7 @@ Click the PDF Smith icon in your toolbar to start.
 | Field | File |
 | --- | --- |
 | Store icon (128×128) | `extension/icons/icon-128.png` |
-| Screenshots (1280×800) | `store/screenshots/1-start.png` … `5-result.png` (upload in that order) |
+| Screenshots (1280×800) | `store/screenshots/1-start.png` … `5-result.png` (upload in that order; framed versions — plain captures are in `store/screenshots/raw/`) |
 | Small promo tile (440×280) | `store/promo/small-tile-440x280.png` |
 | Marquee promo tile (1400×560, optional) | `store/promo/marquee-1400x560.png` |
 
@@ -99,3 +99,15 @@ Certify all three statements:
 ## Notes for the reviewer (optional field)
 
 > PDF Smith works entirely offline. The minified files in vendor/ are unmodified official releases of PDF.js 3.11.174 and pdf-lib 1.17.1; vendor/README.md lists their SHA-256 hashes and sources. Click the toolbar icon to open the tool, then drop any PDF onto the page.
+
+## Regenerating the graphics
+
+The promo tiles and framed screenshots are built from `extension/icons/logo-icon.svg` and the plain captures in `store/screenshots/raw/`:
+
+```
+pip install playwright
+playwright install chromium
+python store/design/render.py
+```
+
+To change a headline, edit `SHOTS` in `store/design/render.py`.
