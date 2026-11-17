@@ -1,8 +1,10 @@
 {
   "manifest_version": 3,
   "name": "PDF Smith",
-  "version": "1.1.0",
-  "description": "Reorder, rotate, add text, merge, and compress PDFs to a target file size — entirely in your browser.",
+  "version": "1.2.0",
+  "description": "Secure, offline PDF editor. Reorder, rotate, add text, merge and compress PDFs to a target size — nothing is uploaded.",
+  "minimum_chrome_version": "116",
+  "homepage_url": "https://github.com/anamsimon/pdf-smith",
   "action": {
     "default_title": "Open PDF Smith",
     "default_icon": {
@@ -21,11 +23,7 @@
   "background": {
     "service_worker": "background.js"
   },
-  "permissions": ["downloads"],
-  "web_accessible_resources": [
-    {
-      "resources": ["vendor/pdf.worker.min.js"],
-      "matches": ["<all_urls>"]
-    }
+  "permissions": [
+    "downloads"
   ]
 }

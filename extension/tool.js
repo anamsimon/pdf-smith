@@ -24,6 +24,16 @@ const insertMenu       = $('insertMenu');
 const insertMenuLabel  = $('insertMenuLabel');
 const undoBtn          = $('undoBtn');
 const redoBtn          = $('redoBtn');
+const shapeToolBtns    = document.querySelectorAll('#shapeTools [data-shape]');
+const shapeBar         = $('shapeBar');
+const spStroke         = $('spStroke');
+const spStrokeSwatch   = $('spStrokeSwatch');
+const spWidth          = $('spWidth');
+const spFillGroup      = $('spFillGroup');
+const spFill           = $('spFill');
+const spFillSwatch     = $('spFillSwatch');
+const spNoFill         = $('spNoFill');
+const spDelete         = $('spDelete');
 const modeBanner       = $('modeBanner');
 
 const zoomOutBtn       = $('zoomOutBtn');
@@ -105,6 +115,16 @@ let activeAnn = null;     // { idx, annId, editing, isNew, dirty, preSnapshot }
 let dragState = null;     // active annotation drag
 let nextAnnId = 1;
 const lastStyle = { fontFamily: 'Helvetica', fontSize: 16, bold: false, italic: false, color: '#000000' };
+
+// Shapes: stored in ref.annotations as { type: 'shape', shape, xFrac, yFrac,
+// x2Frac, y2Frac, stroke, strokeWidth (pt), fill|null }. The two points are
+// the drag start/end, so lines and boxes share one representation.
+const SHAPE_KINDS = { rect: 'rectangle', ellipse: 'ellipse', line: 'line', arrow: 'arrow' };
+const SVG_NS = 'http://www.w3.org/2000/svg';
+let shapeTool = null;     // 'rect' | 'ellipse' | 'line' | 'arrow' | null
+let activeShape = null;   // { idx, annId, dirty }
+let shapeDrag = null;     // active draw / move / resize
+const lastShapeStyle = { stroke: '#DC2626', strokeWidth: 2, fill: null };
 
 let unit = 'KB';
 let busy = false;
@@ -192,6 +212,7 @@ function clearHistory() {
 // Rebuild the UI after pageOrder is swapped to a restored snapshot.
 function applyRestoredState() {
   dragState = null;
+  shapeDrag = null;
   if (currentRef) {
     const key = refKey(currentRef);
     currentRef = pageOrder.find(r => refKey(r) === key) || pageOrder[0] || null;
@@ -240,7 +261,11 @@ document.addEventListener('keydown', (e) => {
   const inField = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (t && t.isContentEditable);
 
   if (e.key === 'Escape') {
+    if (exportOpen()) { closeExport(); exportBtn.focus(); return; }
     if (!insertMenu.classList.contains('hidden')) { closeInsertMenu(); insertMenuBtn.focus(); return; }
+    if (shapeDrag) return;
+    if (activeShape) { deselectShape(); return; }
+    if (shapeTool) { setShapeTool(null); return; }
     if (activeAnn) { e.preventDefault(); finalizeActive(); return; }
     if (textMode) { setTextMode(false); return; }
     return;
@@ -255,16 +280,24 @@ document.addEventListener('keydown', (e) => {
   }
   if (e.altKey) return;
 
+  if (e.key === '[') { e.preventDefault(); togglePanel('pages'); return; }
+  if (e.key.toLowerCase() === 'e') { e.preventDefault(); toggleExport(); return; }
+
   // Only act on selected text when focus isn't on another control (a focused
   // button should still respond to Enter, for example).
   const focusOnPage = t === document.body || t === document.documentElement || previewEl.contains(t);
+  if (activeShape && focusOnPage && (e.key === 'Delete' || e.key === 'Backspace')) {
+    e.preventDefault(); deleteActiveShape(); return;
+  }
   if (activeAnn && !activeAnn.editing && focusOnPage) {
     if (e.key === 'Delete' || e.key === 'Backspace') { e.preventDefault(); deleteActiveAnnotation(); return; }
     if (e.key === 'Enter') { e.preventDefault(); startEditing(); return; }
   }
   const k = e.key.toLowerCase();
+  const shapeKeys = { r: 'rect', o: 'ellipse', l: 'line', a: 'arrow' };
   if (k === 't') { e.preventDefault(); setTextMode(!textMode); }
-  else if (k === 'v') { e.preventDefault(); setTextMode(false); }
+  else if (k === 'v') { e.preventDefault(); setShapeTool(null); setTextMode(false); }
+  else if (shapeKeys[k]) { e.preventDefault(); setShapeTool(shapeTool === shapeKeys[k] ? null : shapeKeys[k]); }
 });
 
 // ---- Start screen ------------------------------------------------------------
@@ -292,15 +325,39 @@ uploader.addEventListener('drop', e => {
 function setTextMode(on) {
   textMode = !!on;
   if (!textMode) finalizeActive();
-  textModeBtn.setAttribute('aria-pressed', String(textMode));
-  selectModeBtn.setAttribute('aria-pressed', String(!textMode));
-  viewer.classList.toggle('text-mode', textMode);
-  modeBanner.classList.toggle('hidden', !textMode);
+  if (textMode) { shapeTool = null; deselectShape(); }
+  updateModeUI();
 }
-selectModeBtn.addEventListener('click', () => setTextMode(false));
+
+function setShapeTool(kind) {
+  if (textMode) { textMode = false; finalizeActive(); }
+  shapeTool = SHAPE_KINDS[kind] ? kind : null;
+  if (shapeTool) deselectShape();
+  updateModeUI();
+}
+
+function updateModeUI() {
+  textModeBtn.setAttribute('aria-pressed', String(textMode));
+  shapeToolBtns.forEach(b => b.setAttribute('aria-pressed', String(b.dataset.shape === shapeTool)));
+  selectModeBtn.setAttribute('aria-pressed', String(!textMode && !shapeTool));
+  viewer.classList.toggle('text-mode', textMode);
+  viewer.classList.toggle('shape-mode', !!shapeTool);
+  modeBanner.classList.toggle('hidden', !textMode && !shapeTool);
+  const icon = $('modeBannerIcon'), text = $('modeBannerText');
+  if (shapeTool) {
+    icon.innerHTML = `<svg class="ic" width="14" height="14"><use href="#i-${shapeTool}"/></svg>`;
+    const how = shapeTool === 'line' || shapeTool === 'arrow' ? 'Shift snaps to 45°' : 'Shift keeps it square';
+    text.textContent = `Drag on a page to draw ${shapeTool === 'ellipse' || shapeTool === 'arrow' ? 'an' : 'a'} ${SHAPE_KINDS[shapeTool]}. ${how}. Esc to exit.`;
+  } else {
+    icon.textContent = 'T';
+    text.textContent = 'Text mode — click anywhere on a page to add text. Press Esc to exit.';
+  }
+}
+selectModeBtn.addEventListener('click', () => { setShapeTool(null); setTextMode(false); });
 textModeBtn.addEventListener('click', () => setTextMode(!textMode));
 
 function openInsertMenu() {
+  closeExport();
   insertMenuLabel.textContent = pageOrder.length ? `After page ${currentIndex() + 1}` : 'At the end';
   insertMenu.classList.remove('hidden');
   insertMenuBtn.setAttribute('aria-expanded', 'true');
@@ -315,6 +372,10 @@ insertMenuBtn.addEventListener('click', (e) => {
   e.stopPropagation();
   if (insertMenu.classList.contains('hidden')) openInsertMenu(); else closeInsertMenu();
 });
+
+shapeToolBtns.forEach(btn => btn.addEventListener('click', () => {
+  setShapeTool(shapeTool === btn.dataset.shape ? null : btn.dataset.shape);
+}));
 $('insertFileMenuItem').addEventListener('click', () => {
   closeInsertMenu();
   triggerInsert(pageOrder.length ? currentIndex() + 1 : 0);
@@ -389,6 +450,10 @@ changeFileBtn.addEventListener('click', () => {
   if (busy) { toast('Wait for the export to finish, or cancel it first.'); return; }
   if (isDirty() && !confirm('Close this file? Your unsaved edits will be lost.')) return;
   finalizeActive();
+  closeExport();
+  clearDraft();
+  resetAutosaveSession();
+  if (!autosaveOn) setAutosaveStatus('Auto-save off');
   loadGeneration++;
   if (previewRenderObserver) { previewRenderObserver.disconnect(); previewRenderObserver = null; }
   zoomMode = 'width'; updateZoomUI();
@@ -448,7 +513,7 @@ function isOrderChanged() {
 }
 
 function hasAnnotations() {
-  return pageOrder.some(r => r.annotations && r.annotations.some(a => a.text));
+  return pageOrder.some(r => r.annotations && r.annotations.some(a => a.text || a.type === 'shape'));
 }
 
 function isEdited() {
@@ -486,6 +551,7 @@ function sourceBytesInUse() {
 function updateEditStatus() {
   const total = pageOrder.length;
   pageCountEl.textContent = `PAGES · ${total}`;
+  $('pagesRailLabel').textContent = `PAGES · ${total}`;
   resetBtn.disabled = !(isEdited() || docs.length > 1);
   const parts = [`${total} page${total === 1 ? '' : 's'}`, fmt(fileSizeInUse())];
   headerSubtitle.innerHTML = escapeHtml(parts.join(' · ')) +
@@ -515,6 +581,9 @@ async function handleFiles(files) {
   if (skipped.length) toast(`Skipped ${skipped.join(', ')} — only PDF, JPG and PNG files are supported.`);
   if (!valid.length) return;
   const gen = ++loadGeneration;
+  resetAutosaveSession();
+  if (autosaveOn) setAutosaveStatus('');
+  $('restoreCard').classList.add('hidden');
 
   currentFile = valid[0].file;
   headerTitle.textContent = valid.length === 1 ? valid[0].file.name : `${valid[0].file.name} + ${valid.length - 1} more`;
@@ -878,9 +947,25 @@ function rotatePageByKey(key) {
     r.rotation = newRot;
     // A 90° clockwise turn maps the anchor (x, y) to (1 - y, x).
     (r.annotations || []).forEach(a => {
+      if (a.type === 'shape' && a.shape === 'image') {
+        // Images stay upright: move the centre, keep the size in points.
+        const pa = a.pageAspect || 1;
+        const cx = (a.xFrac + a.x2Frac) / 2, cy = (a.yFrac + a.y2Frac) / 2;
+        const hw = Math.abs(a.x2Frac - a.xFrac) / 2 * pa, hh = Math.abs(a.y2Frac - a.yFrac) / 2 / pa;
+        const ncx = Math.max(hw, Math.min(1 - hw, 1 - cy)), ncy = Math.max(hh, Math.min(1 - hh, cx));
+        a.xFrac = ncx - hw; a.x2Frac = ncx + hw;
+        a.yFrac = ncy - hh; a.y2Frac = ncy + hh;
+        a.pageAspect = 1 / pa;
+        return;
+      }
       const x = a.xFrac, y = a.yFrac;
       a.xFrac = Math.max(0, Math.min(1, 1 - y));
       a.yFrac = Math.max(0, Math.min(1, x));
+      if (a.type === 'shape') {
+        const x2 = a.x2Frac, y2 = a.y2Frac;
+        a.x2Frac = Math.max(0, Math.min(1, 1 - y2));
+        a.y2Frac = Math.max(0, Math.min(1, x2));
+      }
     });
   });
   previewEl.querySelectorAll('.preview-page').forEach(slot => {
@@ -1085,6 +1170,8 @@ function cssScaleFor(baseViewport) {
 
 function buildContinuousPreview(scrollToRef) {
   finalizeActive();
+  activeShape = null;
+  hideShapeBar();
   if (previewRenderObserver) { previewRenderObserver.disconnect(); previewRenderObserver = null; }
   previewEl.querySelectorAll('.preview-page').forEach(s => { if (s._task) { try { s._task.cancel(); } catch {} } });
   previewEl.innerHTML = '';
@@ -1100,6 +1187,9 @@ function buildContinuousPreview(scrollToRef) {
     wrap.className = 'page-canvas-wrap';
     const canvas = document.createElement('canvas');
     wrap.appendChild(canvas);
+    const shapeLayer = document.createElement('div');
+    shapeLayer.className = 'shape-layer';
+    wrap.appendChild(shapeLayer);
     const layer = document.createElement('div');
     layer.className = 'annot-layer';
     wrap.appendChild(layer);
@@ -1187,6 +1277,9 @@ async function renderPageIntoSlot(slot, idx) {
 function drawAnnotationsOnCanvas(canvas, annotations, renderScale) {
   const ctx = canvas.getContext('2d');
   for (const ann of annotations) {
+    if (ann.type === 'shape') drawShapeOnCanvas(ctx, ann, canvas.width, canvas.height, renderScale);
+  }
+  for (const ann of annotations) {
     if (ann.type !== 'text' || !ann.text) continue;
     const x  = ann.xFrac * canvas.width;
     const y  = ann.yFrac * canvas.height;
@@ -1244,6 +1337,7 @@ function applyAnnStyle(el, ann, scale) {
 
 // Render text annotations as interactive DOM elements overlaying the page canvas.
 function renderAnnotationLayer(slot, idx) {
+  renderShapeLayer(slot, idx);
   const layer = slot.querySelector('.annot-layer');
   if (!layer) return;
   const scale = slot._scale || 1;
@@ -1590,6 +1684,1050 @@ function endAnnotationDrag(e) {
 previewEl.addEventListener('pointerup', endAnnotationDrag);
 previewEl.addEventListener('pointercancel', endAnnotationDrag);
 
+// ---- Shapes ------------------------------------------------------------------
+// One geometry function feeds all three renderers (on-page SVG, the compressed
+// canvas, and vector PDF), so saved shapes match the preview exactly.
+// W, H: displayed page size in output units; s: output units per PDF point.
+function shapeGeometry(ann, W, H, s) {
+  const x1 = ann.xFrac * W, y1 = ann.yFrac * H, x2 = ann.x2Frac * W, y2 = ann.y2Frac * H;
+  const sw = (ann.strokeWidth || 0) * s;
+  if (ann.shape === 'rect' || ann.shape === 'image') {
+    const l = Math.min(x1, x2), r = Math.max(x1, x2), t = Math.min(y1, y2), b = Math.max(y1, y2);
+    return { body: [['M', l, t], ['L', r, t], ['L', r, b], ['L', l, b], ['Z']], closed: true, head: null };
+  }
+  if (ann.shape === 'ellipse') {
+    const cx = (x1 + x2) / 2, cy = (y1 + y2) / 2, rx = Math.abs(x2 - x1) / 2, ry = Math.abs(y2 - y1) / 2;
+    const k = 0.5522847498, kx = k * rx, ky = k * ry;
+    return {
+      body: [
+        ['M', cx + rx, cy],
+        ['C', cx + rx, cy + ky, cx + kx, cy + ry, cx, cy + ry],
+        ['C', cx - kx, cy + ry, cx - rx, cy + ky, cx - rx, cy],
+        ['C', cx - rx, cy - ky, cx - kx, cy - ry, cx, cy - ry],
+        ['C', cx + kx, cy - ry, cx + rx, cy - ky, cx + rx, cy],
+        ['Z'],
+      ],
+      closed: true, head: null,
+    };
+  }
+  if (ann.shape === 'arrow') {
+    const len = Math.hypot(x2 - x1, y2 - y1);
+    if (len > 1e-6) {
+      const ux = (x2 - x1) / len, uy = (y2 - y1) / len;
+      const L = Math.min(Math.max(sw, s) * 3 + 6 * s, len);
+      const hw = L * 0.5;
+      const bx = x2 - ux * L, by = y2 - uy * L;
+      const ex = x2 - ux * L * 0.8, ey = y2 - uy * L * 0.8;
+      return {
+        body: [['M', x1, y1], ['L', ex, ey]],
+        closed: false,
+        head: [['M', x2, y2], ['L', bx - uy * hw, by + ux * hw], ['L', bx + uy * hw, by - ux * hw], ['Z']],
+      };
+    }
+  }
+  return { body: [['M', x1, y1], ['L', x2, y2]], closed: false, head: null };
+}
+
+function pathToD(cmds, map) {
+  const f = n => (Math.round(n * 1000) / 1000).toString();
+  return cmds.map(([op, ...nums]) => {
+    if (op === 'Z') return 'Z';
+    const out = [];
+    for (let i = 0; i < nums.length; i += 2) {
+      const [x, y] = map ? map(nums[i], nums[i + 1]) : [nums[i], nums[i + 1]];
+      out.push(f(x), f(y));
+    }
+    return op + ' ' + out.join(' ');
+  }).join(' ');
+}
+
+function shapeHasFill(ann) { return (ann.shape === 'rect' || ann.shape === 'ellipse') && !!ann.fill; }
+function shapeStrokeWidth(ann) {
+  if (ann.shape === 'image') return 0;
+  // Lines and arrows always need an outline.
+  return ann.shape === 'line' || ann.shape === 'arrow' ? Math.max(ann.strokeWidth || 0, 1) : (ann.strokeWidth || 0);
+}
+
+function drawShapeOnCanvas(ctx, ann, W, H, s) {
+  if (ann.shape === 'image') {
+    const im = placedImages.get(ann.imgId);
+    if (im) {
+      ctx.drawImage(im.el, Math.min(ann.xFrac, ann.x2Frac) * W, Math.min(ann.yFrac, ann.y2Frac) * H,
+        Math.abs(ann.x2Frac - ann.xFrac) * W, Math.abs(ann.y2Frac - ann.yFrac) * H);
+    }
+    return;
+  }
+  const g = shapeGeometry(ann, W, H, s);
+  const sw = shapeStrokeWidth(ann);
+  ctx.save();
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'miter';
+  const body = new Path2D(pathToD(g.body));
+  if (shapeHasFill(ann)) { ctx.fillStyle = ann.fill; ctx.fill(body); }
+  if (sw > 0) {
+    ctx.strokeStyle = ann.stroke || '#000000';
+    ctx.lineWidth = sw * s;
+    ctx.stroke(body);
+  }
+  if (g.head) { ctx.fillStyle = ann.stroke || '#000000'; ctx.fill(new Path2D(pathToD(g.head))); }
+  ctx.restore();
+}
+
+// Shapes are stored in the page's displayed (rotated, cropped) frame; map each
+// point back into PDF user space the same way text annotations are placed.
+function drawShapeOnPdfPage(pg, ann, box, rot) {
+  const W = box.width, H = box.height;
+  const sideways = rot === 90 || rot === 270;
+  const Wd = sideways ? H : W, Hd = sideways ? W : H;
+  const toPdf = (px, py) => {
+    const u = px / Wd, v = py / Hd;
+    let X, Y;
+    if (rot === 90)       { X = v * W;       Y = u * H; }
+    else if (rot === 180) { X = (1 - u) * W; Y = v * H; }
+    else if (rot === 270) { X = (1 - v) * W; Y = (1 - u) * H; }
+    else                  { X = u * W;       Y = (1 - v) * H; }
+    // drawSvgPath flips y, so hand it (X, -Y).
+    return [box.x + X, -(box.y + Y)];
+  };
+  const g = shapeGeometry(ann, Wd, Hd, 1);
+  const sw = shapeStrokeWidth(ann);
+  const opts = { x: 0, y: 0 };
+  if (shapeHasFill(ann)) opts.color = hexToRgb(ann.fill);
+  if (sw > 0) {
+    opts.borderColor = hexToRgb(ann.stroke);
+    opts.borderWidth = sw;
+    if (PDFLib.LineCapStyle) opts.borderLineCap = PDFLib.LineCapStyle.Round;
+  }
+  if (opts.color || opts.borderColor) pg.drawSvgPath(pathToD(g.body, toPdf), opts);
+  if (g.head) pg.drawSvgPath(pathToD(g.head, toPdf), { x: 0, y: 0, color: hexToRgb(ann.stroke) });
+}
+
+function svgEl(tag, attrs) {
+  const el = document.createElementNS(SVG_NS, tag);
+  for (const k in attrs) el.setAttribute(k, attrs[k]);
+  return el;
+}
+
+function renderShapeLayer(slot, idx) {
+  const layer = slot.querySelector('.shape-layer');
+  if (!layer) return;
+  layer.innerHTML = '';
+  const ref = pageOrder[idx];
+  const shapes = ref && ref.annotations ? ref.annotations.filter(a => a.type === 'shape') : [];
+  if (!shapes.length) { if (activeShape && activeShape.idx === idx) positionShapeBar(); return; }
+  const canvas = slot.querySelector('canvas');
+  const W = parseFloat(canvas.style.width) || canvas.clientWidth || 1;
+  const H = parseFloat(canvas.style.height) || canvas.clientHeight || 1;
+  const s = slot._scale || 1;
+  const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: 'none' });
+  for (const ann of shapes) {
+    if (ann.id == null) ann.id = nextAnnId++;
+    const g = shapeGeometry(ann, W, H, s);
+    const sw = shapeStrokeWidth(ann) * s;
+    const selected = activeShape && activeShape.idx === idx && activeShape.annId === ann.id;
+    const group = svgEl('g', { class: 'shape' + (selected ? ' selected' : '') });
+    const d = pathToD(g.body);
+    const fillD = g.head ? d + ' ' + pathToD(g.head) : d;
+    // Visible shape
+    if (ann.shape === 'image') {
+      const im = placedImages.get(ann.imgId);
+      if (im) group.appendChild(svgEl('image', {
+        href: im.url, class: 'shape-image', preserveAspectRatio: 'none',
+        x: Math.min(ann.xFrac, ann.x2Frac) * W, y: Math.min(ann.yFrac, ann.y2Frac) * H,
+        width: Math.abs(ann.x2Frac - ann.xFrac) * W, height: Math.abs(ann.y2Frac - ann.yFrac) * H,
+      }));
+    }
+    if (shapeHasFill(ann)) group.appendChild(svgEl('path', { d, fill: ann.fill, stroke: 'none' }));
+    if (sw > 0) group.appendChild(svgEl('path', { d, fill: 'none', stroke: ann.stroke, 'stroke-width': sw, 'stroke-linecap': 'round', 'stroke-linejoin': 'miter' }));
+    if (g.head) group.appendChild(svgEl('path', { d: pathToD(g.head), fill: ann.stroke, stroke: 'none' }));
+    // Generous invisible hit target; closed shapes are grabbable anywhere inside.
+    const hit = svgEl('path', {
+      d: fillD, class: 'shape-hit', fill: 'none', stroke: 'transparent',
+      'stroke-width': Math.max(14, sw + 10),
+      'pointer-events': g.closed ? 'all' : 'stroke',
+      'data-idx': String(idx), 'data-ann-id': String(ann.id),
+    });
+    group.appendChild(hit);
+    if (g.closed) {
+      const xs = [ann.xFrac * W, ann.x2Frac * W], ys = [ann.yFrac * H, ann.y2Frac * H];
+      group.appendChild(svgEl('rect', {
+        class: 'shape-outline',
+        x: Math.min(...xs) - 3, y: Math.min(...ys) - 3,
+        width: Math.abs(xs[1] - xs[0]) + 6, height: Math.abs(ys[1] - ys[0]) + 6,
+      }));
+    } else {
+      group.appendChild(svgEl('path', { d, class: 'shape-outline' }));
+    }
+    svg.appendChild(group);
+  }
+  layer.appendChild(svg);
+
+  // Resize handles for the selected shape.
+  const sel = activeShape && activeShape.idx === idx ? shapes.find(a => a.id === activeShape.annId) : null;
+  if (sel) {
+    const corners = sel.shape === 'line' || sel.shape === 'arrow'
+      ? [['xFrac', 'yFrac'], ['x2Frac', 'y2Frac']]
+      : [['xFrac', 'yFrac'], ['x2Frac', 'yFrac'], ['xFrac', 'y2Frac'], ['x2Frac', 'y2Frac']];
+    for (const [hx, hy] of corners) {
+      const h = document.createElement('div');
+      h.className = 'shape-handle';
+      h.dataset.idx = String(idx);
+      h.dataset.annId = String(sel.id);
+      h.dataset.hx = hx;
+      h.dataset.hy = hy;
+      h.style.left = (sel[hx] * 100) + '%';
+      h.style.top = (sel[hy] * 100) + '%';
+      if (sel.shape === 'line' || sel.shape === 'arrow') h.style.cursor = 'crosshair';
+      else {
+        const other = k => (k.startsWith('x2') ? k.replace('x2', 'x') : k.startsWith('y2') ? k.replace('y2', 'y') : k[0] + '2Frac');
+        const left = sel[hx] <= sel[other(hx)], top = sel[hy] <= sel[other(hy)];
+        h.style.cursor = left === top ? 'nwse-resize' : 'nesw-resize';
+      }
+      layer.appendChild(h);
+    }
+  }
+  if (activeShape && activeShape.idx === idx) positionShapeBar();
+}
+
+function refreshShapes(idx) {
+  const slot = previewEl.querySelectorAll('.preview-page')[idx];
+  if (slot) renderShapeLayer(slot, idx);
+}
+
+function activeShapeAnn() {
+  return activeShape ? getAnn(activeShape.idx, activeShape.annId) : null;
+}
+
+function selectShape(idx, annId) {
+  finalizeActive();
+  if (activeShape && activeShape.idx === idx && activeShape.annId === annId) return;
+  const prev = activeShape;
+  activeShape = { idx, annId, dirty: false };
+  if (prev && prev.idx !== idx) refreshShapes(prev.idx);
+  const ann = activeShapeAnn();
+  if (ann) loadShapeBar(ann);
+  refreshShapes(idx);
+}
+
+function deselectShape() {
+  if (!activeShape) return;
+  const idx = activeShape.idx;
+  activeShape = null;
+  hideShapeBar();
+  refreshShapes(idx);
+}
+
+function deleteActiveShape() {
+  if (!activeShape) return;
+  const { idx, annId } = activeShape;
+  const ref = pageOrder[idx];
+  if (!ref) return;
+  recordHistory();
+  ref.annotations = ref.annotations.filter(a => a.id !== annId);
+  deselectShape();
+  updateEditStatus();
+}
+
+function loadShapeBar(ann) {
+  shapeBar.classList.toggle('is-image', ann.shape === 'image');
+  shapeBar.setAttribute('aria-label', ann.shape === 'image' ? 'Image' : 'Shape style');
+  spDelete.setAttribute('aria-label', ann.shape === 'image' ? 'Delete image' : 'Delete shape');
+  spStroke.value = ann.stroke || '#000000';
+  spStrokeSwatch.style.borderColor = spStroke.value;
+  const fillable = ann.shape === 'rect' || ann.shape === 'ellipse';
+  spFillGroup.classList.toggle('hidden', !fillable);
+  spWidth.querySelector('option[value="0"]').disabled = !fillable;
+  spWidth.value = String(ann.strokeWidth || 0);
+  if (ann.fill) spFill.value = ann.fill;
+  spFillSwatch.style.background = ann.fill || '';
+  spFillSwatch.classList.toggle('is-none', !ann.fill);
+  spNoFill.setAttribute('aria-pressed', String(!ann.fill));
+}
+
+function positionShapeBar() {
+  const ann = activeShapeAnn();
+  const slot = activeShape && previewEl.querySelectorAll('.preview-page')[activeShape.idx];
+  const wrap = slot && slot.querySelector('.page-canvas-wrap');
+  if (!ann || !wrap) { hideShapeBar(); return; }
+  if (shapeBar.parentNode !== wrap) wrap.appendChild(shapeBar);
+  shapeBar.classList.remove('hidden');
+  const wrapW = wrap.clientWidth, wrapH = wrap.clientHeight;
+  const minX = Math.min(ann.xFrac, ann.x2Frac) * wrapW;
+  const minY = Math.min(ann.yFrac, ann.y2Frac) * wrapH;
+  const maxY = Math.max(ann.yFrac, ann.y2Frac) * wrapH;
+  const barW = shapeBar.offsetWidth, barH = shapeBar.offsetHeight;
+  let left = minX;
+  if (left + barW > wrapW) left = Math.max(wrapW - barW, Math.min(left, 0));
+  let top = minY - barH - 14;
+  if (top < -24) top = maxY + 14;
+  shapeBar.style.left = left + 'px';
+  shapeBar.style.top = top + 'px';
+}
+
+function hideShapeBar() {
+  shapeBar.classList.add('hidden');
+  if (shapeBar.parentNode !== document.body) document.body.appendChild(shapeBar);
+}
+
+function updateShapeStyle(patch) {
+  const ann = activeShapeAnn();
+  if (!ann) return;
+  if (!activeShape.dirty) { recordHistory(); activeShape.dirty = true; }
+  Object.assign(ann, patch);
+  Object.assign(lastShapeStyle, patch);
+  loadShapeBar(ann);
+  refreshShapes(activeShape.idx);
+  updateEditStatus();
+}
+
+spStroke.addEventListener('input', () => updateShapeStyle({ stroke: spStroke.value }));
+spWidth.addEventListener('change', () => {
+  const w = parseFloat(spWidth.value) || 0;
+  const ann = activeShapeAnn();
+  // An outline-less shape with no fill would vanish, so give it a fill.
+  if (w === 0 && ann && !ann.fill) updateShapeStyle({ strokeWidth: 0, fill: spFill.value });
+  else updateShapeStyle({ strokeWidth: w });
+});
+spFill.addEventListener('input', () => updateShapeStyle({ fill: spFill.value }));
+spNoFill.addEventListener('click', () => {
+  const ann = activeShapeAnn();
+  if (ann && !(ann.strokeWidth > 0)) updateShapeStyle({ fill: null, strokeWidth: 2 });
+  else updateShapeStyle({ fill: null });
+});
+spDelete.addEventListener('click', deleteActiveShape);
+['pointerdown', 'click', 'dblclick'].forEach(ev => shapeBar.addEventListener(ev, e => e.stopPropagation()));
+
+// Clicking anywhere else drops the shape selection.
+document.addEventListener('pointerdown', (e) => {
+  if (!activeShape) return;
+  if (e.target.closest('.shape-hit, .shape-handle, #shapeBar')) return;
+  deselectShape();
+}, true);
+
+const clamp01 = n => Math.max(0, Math.min(1, n));
+
+previewEl.addEventListener('pointerdown', (e) => {
+  if (e.button !== 0) return;
+  if (e.target.closest('.annot, #styleBar, #shapeBar')) return;
+  const wrap = e.target.closest('.page-canvas-wrap');
+  if (!wrap) return;
+  const slot = wrap.closest('.preview-page');
+  const idx = parseInt(slot.dataset.idx);
+  const ref = pageOrder[idx];
+  if (!ref) return;
+  const rect = slot.querySelector('canvas').getBoundingClientRect();
+  const fx = clamp01((e.clientX - rect.left) / rect.width);
+  const fy = clamp01((e.clientY - rect.top) / rect.height);
+  const handle = e.target.closest('.shape-handle');
+  const hit = e.target.closest('.shape-hit');
+  let mode, ann;
+  if (handle && !shapeTool && !textMode) {
+    ann = getAnn(idx, parseInt(handle.dataset.annId));
+    mode = 'resize';
+  } else if (hit && !shapeTool && !textMode) {
+    ann = getAnn(idx, parseInt(hit.dataset.annId));
+    if (ann) selectShape(idx, ann.id);
+    mode = 'move';
+  } else if (shapeTool) {
+    finalizeActive();
+    const preSnapshot = clonePageOrder();
+    if (!ref.annotations) ref.annotations = [];
+    ann = { id: nextAnnId++, type: 'shape', shape: shapeTool, xFrac: fx, yFrac: fy, x2Frac: fx, y2Frac: fy, ...lastShapeStyle };
+    if (ann.shape === 'line' || ann.shape === 'arrow') ann.strokeWidth = Math.max(ann.strokeWidth || 0, 1);
+    else if (!ann.fill && !(ann.strokeWidth > 0)) ann.strokeWidth = 2;
+    ref.annotations.push(ann);
+    activeShape = { idx, annId: ann.id, dirty: false };
+    mode = 'draw';
+    shapeDrag = { preSnapshot };
+  }
+  if (!mode || !ann) return;
+  e.preventDefault();
+  shapeDrag = {
+    ...(shapeDrag || {}),
+    mode, idx, ann, rect, slot,
+    hx: handle && handle.dataset.hx, hy: handle && handle.dataset.hy,
+    startX: e.clientX, startY: e.clientY,
+    start: { xFrac: ann.xFrac, yFrac: ann.yFrac, x2Frac: ann.x2Frac, y2Frac: ann.y2Frac },
+    moved: false,
+    preSnapshot: (shapeDrag && shapeDrag.preSnapshot) || clonePageOrder(),
+  };
+  try { previewEl.setPointerCapture(e.pointerId); } catch {}
+  if (mode === 'draw') { hideShapeBar(); refreshShapes(idx); }
+});
+
+previewEl.addEventListener('pointermove', (e) => {
+  const sd = shapeDrag;
+  if (!sd) return;
+  if (Math.abs(e.clientX - sd.startX) > 3 || Math.abs(e.clientY - sd.startY) > 3) sd.moved = true;
+  if (!sd.moved) return;
+  const { ann, rect, start } = sd;
+  const fx = clamp01((e.clientX - rect.left) / rect.width);
+  const fy = clamp01((e.clientY - rect.top) / rect.height);
+  if (sd.mode === 'move') {
+    let dx = (e.clientX - sd.startX) / rect.width;
+    let dy = (e.clientY - sd.startY) / rect.height;
+    dx = Math.max(-Math.min(start.xFrac, start.x2Frac), Math.min(1 - Math.max(start.xFrac, start.x2Frac), dx));
+    dy = Math.max(-Math.min(start.yFrac, start.y2Frac), Math.min(1 - Math.max(start.yFrac, start.y2Frac), dy));
+    ann.xFrac = start.xFrac + dx; ann.x2Frac = start.x2Frac + dx;
+    ann.yFrac = start.yFrac + dy; ann.y2Frac = start.y2Frac + dy;
+  } else {
+    // draw moves the end point; resize moves whichever corner was grabbed.
+    const hx = sd.mode === 'draw' ? 'x2Frac' : sd.hx;
+    const hy = sd.mode === 'draw' ? 'y2Frac' : sd.hy;
+    const ox = sd.mode === 'draw' ? 'xFrac' : (hx === 'xFrac' ? 'x2Frac' : 'xFrac');
+    const oy = sd.mode === 'draw' ? 'yFrac' : (hy === 'yFrac' ? 'y2Frac' : 'yFrac');
+    let px = fx, py = fy;
+    const isLine = ann.shape === 'line' || ann.shape === 'arrow';
+    // Images keep their proportions unless Shift is held; boxes become
+    // square with Shift; lines snap to 45° with Shift.
+    const lockRatio = ann.shape === 'image' ? !e.shiftKey : (e.shiftKey && !isLine);
+    if ((e.shiftKey && isLine) || lockRatio) {
+      const ax = ann[ox] * rect.width, ay = ann[oy] * rect.height;
+      let dxp = px * rect.width - ax, dyp = py * rect.height - ay;
+      if (isLine) {
+        const len = Math.hypot(dxp, dyp);
+        const ang = Math.round(Math.atan2(dyp, dxp) / (Math.PI / 4)) * (Math.PI / 4);
+        dxp = Math.cos(ang) * len; dyp = Math.sin(ang) * len;
+      } else {
+        const r = ann.shape === 'image' ? (ann.ratio || 1) : 1;
+        const w = Math.max(Math.abs(dxp), Math.abs(dyp) * r);
+        dxp = Math.sign(dxp || 1) * w; dyp = Math.sign(dyp || 1) * w / r;
+      }
+      px = clamp01((ax + dxp) / rect.width);
+      py = clamp01((ay + dyp) / rect.height);
+    }
+    ann[hx] = px;
+    ann[hy] = py;
+  }
+  renderShapeLayer(sd.slot, sd.idx);
+});
+
+function endShapeDrag(e) {
+  const sd = shapeDrag;
+  if (!sd) return;
+  shapeDrag = null;
+  try { previewEl.releasePointerCapture(e.pointerId); } catch {}
+  const { ann, rect } = sd;
+  if (sd.mode === 'draw') {
+    const tiny = Math.abs(ann.x2Frac - ann.xFrac) * rect.width < 4 && Math.abs(ann.y2Frac - ann.yFrac) * rect.height < 4;
+    if (!sd.moved || tiny) {
+      // A plain click drops a default-sized shape.
+      const isLine = ann.shape === 'line' || ann.shape === 'arrow';
+      const w = (isLine ? 140 : 120) / rect.width, h = (isLine ? 0 : 80) / rect.height;
+      ann.x2Frac = clamp01(ann.xFrac + w);
+      ann.y2Frac = clamp01(ann.yFrac + h);
+      if (ann.x2Frac === ann.xFrac) ann.xFrac = clamp01(ann.x2Frac - w);
+      if (!isLine && ann.y2Frac === ann.yFrac) ann.yFrac = clamp01(ann.y2Frac - h);
+    }
+    commitHistory(sd.preSnapshot);
+    const { idx, annId } = { idx: sd.idx, annId: ann.id };
+    setShapeTool(null);           // back to select so the new shape can be adjusted
+    activeShape = { idx, annId, dirty: false };
+    loadShapeBar(ann);
+    refreshShapes(idx);
+  } else if (sd.moved) {
+    commitHistory(sd.preSnapshot);
+    if (activeShape) activeShape.dirty = false;
+    refreshShapes(sd.idx);
+  }
+  updateEditStatus();
+}
+previewEl.addEventListener('pointerup', endShapeDrag);
+previewEl.addEventListener('pointercancel', endShapeDrag);
+
+
+// ---- Images placed on pages (pasted or picked) --------------------------------
+// Stored as shapes ({ shape: 'image', imgId, ratio, pageAspect }) so selection,
+// moving, resizing, undo and auto-save all come for free. Pixel data lives in
+// this registry, keyed by id, so history snapshots stay small.
+const placedImages = new Map(); // id -> { bytes, mime, w, h, el, url }
+
+async function registerImage(bytes, mime, id) {
+  id = id || ('img' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7));
+  if (placedImages.has(id)) return id;
+  const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
+  const el = new Image();
+  el.src = url;
+  await el.decode();
+  placedImages.set(id, { bytes, mime, w: el.naturalWidth, h: el.naturalHeight, el, url });
+  return id;
+}
+
+// PNG and upright JPEG are kept as-is; anything else (WebP, GIF, rotated
+// JPEG) is redrawn by the browser as PNG so pdf-lib can embed it.
+async function normalizeImage(blob) {
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  if (blob.type === 'image/png') return { bytes, mime: 'image/png' };
+  if (blob.type === 'image/jpeg' && jpegOrientation(bytes) === 1) return { bytes, mime: 'image/jpeg' };
+  if (blob.type === 'image/jpeg') return { bytes: await redrawImage(blob, false), mime: 'image/jpeg' };
+  return { bytes: await redrawImage(blob, true), mime: 'image/png' };
+}
+
+async function placeImageBlob(blob, offsetSteps = 0) {
+  if (!pageOrder.length) return;
+  const idx = Math.max(0, currentIndex());
+  const ref = pageOrder[idx];
+  const slot = previewEl.querySelectorAll('.preview-page')[idx];
+  const canvas = slot && slot.querySelector('canvas');
+  if (!ref || !canvas) return;
+  let id;
+  try {
+    const { bytes, mime } = await normalizeImage(blob);
+    id = await registerImage(bytes, mime);
+  } catch (err) {
+    console.warn('image paste failed', err);
+    toast("Couldn't read that image.");
+    return;
+  }
+  const img = placedImages.get(id);
+  const rect = canvas.getBoundingClientRect();
+  const scale = slot._scale || rect.width / 612;
+  // Natural size at 96 dpi, capped to 60% of the page.
+  let wPx = img.w * 0.75 * scale, hPx = img.h * 0.75 * scale;
+  const k = Math.min(1, (rect.width * 0.6) / wPx, (rect.height * 0.6) / hPx);
+  wPx *= k; hPx *= k;
+  // Centre it in the part of the page that's on screen.
+  const pv = previewEl.getBoundingClientRect();
+  const visTop = Math.max(rect.top, pv.top), visBot = Math.min(rect.bottom, pv.bottom);
+  const cy = (visBot > visTop ? (visTop + visBot) / 2 : rect.top + rect.height / 2) - rect.top + offsetSteps * 24;
+  const cx = rect.width / 2 + offsetSteps * 24;
+  const wF = wPx / rect.width, hF = hPx / rect.height;
+  const x1 = Math.max(0, Math.min(1 - wF, (cx - wPx / 2) / rect.width));
+  const y1 = Math.max(0, Math.min(1 - hF, (cy - hPx / 2) / rect.height));
+
+  finalizeActive();
+  if (textMode || shapeTool) { setShapeTool(null); setTextMode(false); }
+  recordHistory();
+  if (!ref.annotations) ref.annotations = [];
+  const ann = {
+    id: nextAnnId++, type: 'shape', shape: 'image', imgId: id,
+    ratio: img.w / img.h, pageAspect: rect.width / rect.height,
+    xFrac: x1, yFrac: y1, x2Frac: x1 + wF, y2Frac: y1 + hF,
+    stroke: '#000000', strokeWidth: 0, fill: null,
+  };
+  ref.annotations.push(ann);
+  activeShape = null;
+  selectShape(idx, ann.id);
+  updateEditStatus();
+}
+
+// Map a point in the page's displayed frame (pt) to PDF user space.
+function displayToPdf(px, py, box, rot) {
+  const W = box.width, H = box.height;
+  const sideways = rot === 90 || rot === 270;
+  const u = px / (sideways ? H : W), v = py / (sideways ? W : H);
+  let X, Y;
+  if (rot === 90)       { X = v * W;       Y = u * H; }
+  else if (rot === 180) { X = (1 - u) * W; Y = v * H; }
+  else if (rot === 270) { X = (1 - v) * W; Y = (1 - u) * H; }
+  else                  { X = u * W;       Y = (1 - v) * H; }
+  return [box.x + X, box.y + Y];
+}
+
+async function pngBytesFromImage(el) {
+  const c = document.createElement('canvas');
+  c.width = el.naturalWidth; c.height = el.naturalHeight;
+  c.getContext('2d').drawImage(el, 0, 0);
+  const blob = await new Promise(r => c.toBlob(r, 'image/png'));
+  c.width = c.height = 0;
+  return new Uint8Array(await blob.arrayBuffer());
+}
+
+async function drawImageOnPdfPage(doc, pg, ann, box, rot, cache) {
+  const im = placedImages.get(ann.imgId);
+  if (!im) return;
+  let pdfImg = cache.get(ann.imgId);
+  if (!pdfImg) {
+    try { pdfImg = im.mime === 'image/png' ? await doc.embedPng(im.bytes) : await doc.embedJpg(im.bytes); }
+    catch { pdfImg = await doc.embedPng(await pngBytesFromImage(im.el)); }
+    cache.set(ann.imgId, pdfImg);
+  }
+  const sideways = rot === 90 || rot === 270;
+  const Wd = sideways ? box.height : box.width, Hd = sideways ? box.width : box.height;
+  const l = Math.min(ann.xFrac, ann.x2Frac) * Wd, t = Math.min(ann.yFrac, ann.y2Frac) * Hd;
+  const w = Math.abs(ann.x2Frac - ann.xFrac) * Wd, h = Math.abs(ann.y2Frac - ann.yFrac) * Hd;
+  // The image's own origin is its displayed bottom-left corner; rotating by
+  // the page rotation keeps it upright on screen.
+  const [x, y] = displayToPdf(l, t + h, box, rot);
+  pg.drawImage(pdfImg, { x, y, width: w, height: h, rotate: PDFLib.degrees(rot) });
+}
+
+document.addEventListener('paste', (e) => {
+  const t = e.target;
+  const tag = (t && t.tagName) || '';
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (t && t.isContentEditable)) return;
+  const files = Array.from((e.clipboardData && e.clipboardData.items) || [])
+    .filter(i => i.kind === 'file' && i.type.startsWith('image/'))
+    .map(i => i.getAsFile()).filter(Boolean);
+  if (!files.length) return;
+  e.preventDefault();
+  if (viewer.classList.contains('hidden')) { handleFiles(files); return; }
+  (async () => { for (let i = 0; i < files.length; i++) await placeImageBlob(files[i], i); })();
+});
+
+const placeImageInput = $('placeImageFile');
+$('placeImageMenuItem').addEventListener('click', () => {
+  closeInsertMenu();
+  placeImageInput.click();
+});
+placeImageInput.addEventListener('change', async () => {
+  const files = Array.from(placeImageInput.files || []);
+  placeImageInput.value = '';
+  for (let i = 0; i < files.length; i++) await placeImageBlob(files[i], i);
+});
+
+// ---- Swatch color picker -----------------------------------------------------
+// Each style-bar color button opens a palette of preset swatches; "Custom…"
+// still reaches the system picker. The hidden <input type=color> stays the
+// source of truth, so existing 'input' handlers keep working unchanged.
+const SWATCHES = [
+  ['#000000', 'Black'], ['#4B5563', 'Gray'], ['#9CA3AF', 'Light gray'], ['#FFFFFF', 'White'],
+  ['#92400E', 'Brown'], ['#DC2626', 'Red'], ['#EA580C', 'Orange'], ['#F59E0B', 'Amber'],
+  ['#FDE047', 'Yellow'], ['#FEF08A', 'Highlight yellow'], ['#16A34A', 'Green'], ['#0D9488', 'Teal'],
+  ['#2563EB', 'Blue'], ['#4F46E5', 'Indigo'], ['#9333EA', 'Purple'], ['#DB2777', 'Pink'],
+];
+let openSwatch = null; // { pop, trigger }
+
+function closeSwatchPicker(refocus) {
+  if (!openSwatch) return;
+  const { pop, trigger } = openSwatch;
+  openSwatch = null;
+  pop.remove();
+  trigger.setAttribute('aria-expanded', 'false');
+  if (refocus) trigger.focus();
+}
+
+function openSwatchPicker(trigger, input, getCurrent) {
+  closeSwatchPicker();
+  const bar = trigger.closest('.style-bar');
+  const current = (getCurrent ? getCurrent() : input.value) || '';
+  const pop = document.createElement('div');
+  pop.className = 'swatch-pop';
+  pop.setAttribute('role', 'dialog');
+  pop.setAttribute('aria-label', trigger.title || 'Color');
+  const grid = document.createElement('div');
+  grid.className = 'swatch-grid';
+  grid.setAttribute('role', 'radiogroup');
+  const choose = (hex) => {
+    closeSwatchPicker(false);
+    input.value = hex.toLowerCase();
+    // The style handler puts the caret back into text being edited;
+    // otherwise return focus to the color button.
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    if (activeAnn && activeAnn.editing) {
+      const el = activeEl();
+      if (el) {
+        el.focus();
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        range.collapse(false);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+      }
+    } else trigger.focus();
+  };
+  for (const [hex, name] of SWATCHES) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'swatch';
+    b.style.background = hex;
+    b.setAttribute('role', 'radio');
+    b.setAttribute('aria-label', name);
+    b.title = name;
+    const on = current.toLowerCase() === hex.toLowerCase();
+    b.setAttribute('aria-checked', String(on));
+    // Contrasting check mark
+    const n = parseInt(hex.slice(1), 16);
+    const light = ((n >> 16) * 299 + ((n >> 8) & 255) * 587 + (n & 255) * 114) / 1000 > 150;
+    b.innerHTML = `<svg class="ic" width="14" height="14" stroke-width="3" style="color:${light ? '#17181C' : '#fff'}"><use href="#i-check"/></svg>`;
+    b.addEventListener('click', () => choose(hex));
+    grid.appendChild(b);
+  }
+  pop.appendChild(grid);
+
+  const row = document.createElement('div');
+  row.className = 'swatch-custom-row';
+  const custom = document.createElement('button');
+  custom.type = 'button';
+  custom.className = 'swatch-custom';
+  custom.innerHTML = '<span class="swatch-rainbow"></span>Custom…';
+  custom.addEventListener('click', () => {
+    closeSwatchPicker(false);
+    try { input.showPicker(); } catch { input.click(); }
+  });
+  row.appendChild(custom);
+  const cur = document.createElement('span');
+  cur.className = 'swatch-current';
+  cur.textContent = current || 'None';
+  row.appendChild(cur);
+  pop.appendChild(row);
+
+  // Keyboard: arrows move between swatches, Esc closes.
+  pop.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeSwatchPicker(true); return; }
+    const btns = Array.from(grid.querySelectorAll('.swatch'));
+    const i = btns.indexOf(document.activeElement);
+    if (i < 0) return;
+    const step = { ArrowRight: 1, ArrowLeft: -1, ArrowDown: 8, ArrowUp: -8 }[e.key];
+    if (step) { e.preventDefault(); e.stopPropagation(); btns[(i + step + btns.length) % btns.length].focus(); }
+  });
+
+  bar.appendChild(pop);
+  // Below the bar by default; above it if that would leave the viewport.
+  pop.style.left = Math.max(0, Math.min(trigger.offsetLeft - 8, bar.clientWidth - pop.offsetWidth)) + 'px';
+  const barRect = bar.getBoundingClientRect();
+  if (barRect.bottom + pop.offsetHeight + 12 > window.innerHeight) pop.style.bottom = 'calc(100% + 8px)';
+  else pop.style.top = 'calc(100% + 8px)';
+  trigger.setAttribute('aria-expanded', 'true');
+  openSwatch = { pop, trigger };
+  (grid.querySelector('[aria-checked="true"]') || grid.querySelector('.swatch')).focus();
+}
+
+function attachSwatchPicker(input, getCurrent) {
+  const trigger = input.closest('.sb-color');
+  trigger.setAttribute('role', 'button');
+  trigger.setAttribute('aria-haspopup', 'dialog');
+  trigger.setAttribute('aria-expanded', 'false');
+  trigger.tabIndex = 0;
+  input.tabIndex = -1;
+  const toggle = (e) => {
+    e.preventDefault(); // stop the label from opening the system picker
+    if (openSwatch && openSwatch.trigger === trigger) closeSwatchPicker(true);
+    else openSwatchPicker(trigger, input, getCurrent);
+  };
+  trigger.addEventListener('click', (e) => { if (!e.target.closest('.swatch-pop')) toggle(e); });
+  trigger.addEventListener('keydown', (e) => {
+    if ((e.key === 'Enter' || e.key === ' ') && !e.target.closest('.swatch-pop')) toggle(e);
+  });
+}
+
+attachSwatchPicker(tpColor);
+attachSwatchPicker(spStroke);
+attachSwatchPicker(spFill, () => (spNoFill.getAttribute('aria-pressed') === 'true' ? '' : spFill.value));
+
+// Close on outside clicks, and whenever its bar hides or moves.
+document.addEventListener('pointerdown', (e) => {
+  if (openSwatch && !e.target.closest('.swatch-pop, .sb-color')) closeSwatchPicker(false);
+}, true);
+new MutationObserver(() => {
+  if (openSwatch && (openSwatch.trigger.closest('.style-bar.hidden') || !openSwatch.trigger.isConnected)) closeSwatchPicker(false);
+}).observe(document.body, { subtree: true, attributes: true, attributeFilter: ['class'] });
+
+
+// ---- Auto-save (session draft in IndexedDB) ----------------------------------
+// Every 10 s, if there are unexported edits, the session (page order, rotations,
+// text, shapes and source files) is stored in this browser. Source bytes are
+// written once per document; only the small page state is rewritten.
+const AUTOSAVE_MS = 10000;
+const AUTOSAVE_KEY = 'pdfsmith.autosave';
+const autosaveBtn = $('autosaveBtn');
+const autosaveStatus = $('autosaveStatus');
+let autosaveOn = true;
+let autosaveSession = null;     // id of the draft this session writes
+let savedDocEntries = [];       // docs[i] objects already stored for this session
+let savedImageIds = new Set();  // placed images already stored for this session
+let lastAutosaveSig = null;
+let autosaveRunning = false;
+let dbPromise = null;
+
+function idb() {
+  if (!dbPromise) {
+    dbPromise = new Promise((resolve, reject) => {
+      const req = indexedDB.open('pdfsmith', 1);
+      req.onupgradeneeded = () => {
+        req.result.createObjectStore('draft');
+        req.result.createObjectStore('docs');
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    dbPromise.catch(() => { dbPromise = null; });
+  }
+  return dbPromise;
+}
+
+// Run fn(stores) in one transaction; resolves with fn's request result.
+async function idbTx(storeNames, mode, fn) {
+  const db = await idb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeNames, mode);
+    const stores = Object.fromEntries([].concat(storeNames).map(n => [n, tx.objectStore(n)]));
+    const req = fn(stores);
+    tx.oncomplete = () => resolve(req ? req.result : undefined);
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+}
+
+const getDraft = () => idbTx('draft', 'readonly', s => s.draft.get('current'));
+
+async function clearDraft() {
+  lastAutosaveSig = null;
+  try { await idbTx(['draft', 'docs'], 'readwrite', s => { s.draft.clear(); s.docs.clear(); }); } catch {}
+}
+
+function resetAutosaveSession() {
+  autosaveSession = null;
+  savedDocEntries = [];
+  savedImageIds = new Set();
+  lastAutosaveSig = null;
+  setAutosaveStatus('');
+}
+
+function setAutosaveStatus(text, isErr) {
+  autosaveStatus.textContent = text;
+  autosaveStatus.classList.toggle('err', !!isErr);
+}
+
+function autosaveSignature() {
+  return JSON.stringify([pageOrder, docs.length, headerTitle.textContent]);
+}
+
+async function autosaveTick() {
+  if (!autosaveOn || autosaveRunning || !docs[0] || viewer.classList.contains('hidden')) return;
+  autosaveRunning = true;
+  try {
+    if (!isDirty()) {
+      // Nothing unexported left to protect.
+      if (lastAutosaveSig !== 'clean') { await clearDraft(); lastAutosaveSig = 'clean'; savedDocEntries = []; autosaveSession = null; }
+      return;
+    }
+    const sig = autosaveSignature();
+    if (sig === lastAutosaveSig) return;
+    const fresh = !autosaveSession;
+    if (fresh) {
+      autosaveSession = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+      savedDocEntries = [];
+      savedImageIds = new Set();
+    }
+    const sessionId = autosaveSession;
+    const toWrite = [];
+    docs.forEach((d, i) => { if (d && savedDocEntries[i] !== d) toWrite.push([i, d]); });
+    const imageIds = [...new Set(pageOrder.flatMap(r => (r.annotations || []).filter(a => a.imgId).map(a => a.imgId)))]
+      .filter(id => placedImages.has(id));
+    const imgsToWrite = imageIds.filter(id => !savedImageIds.has(id));
+    const draft = {
+      sessionId,
+      savedAt: Date.now(),
+      title: headerTitle.textContent,
+      fileName: currentFile ? currentFile.name : (docs[0].name || 'document.pdf'),
+      fileType: currentFile ? currentFile.type : 'application/pdf',
+      pageOrder: clonePageOrder(),
+      originalPageCount,
+      savedStateJSON,
+      nextAnnId,
+      docMeta: docs.map(d => (d ? { name: d.name, size: d.size } : null)),
+      imageIds,
+    };
+    await idbTx(['draft', 'docs'], 'readwrite', s => {
+      if (fresh) s.docs.clear(); // a new session replaces any older draft
+      for (const [i, d] of toWrite) s.docs.put(d.bytes, `${sessionId}:${i}`);
+      for (const id of imgsToWrite) {
+        const im = placedImages.get(id);
+        s.docs.put({ bytes: im.bytes, mime: im.mime }, `${sessionId}:img:${id}`);
+      }
+      return s.draft.put(draft, 'current');
+    });
+    if (sessionId !== autosaveSession) return; // file closed or replaced meanwhile
+    for (const [i, d] of toWrite) savedDocEntries[i] = d;
+    imgsToWrite.forEach(id => savedImageIds.add(id));
+    lastAutosaveSig = sig;
+    const t = new Date(draft.savedAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    setAutosaveStatus(`Draft saved ${t}`);
+    autosaveBtn.title = `Draft saved in this browser at ${t}. Saves every 10 seconds.`;
+  } catch (err) {
+    console.warn('auto-save failed', err);
+    setAutosaveStatus(err && err.name === 'QuotaExceededError' ? 'Auto-save: not enough space' : 'Auto-save failed', true);
+  } finally {
+    autosaveRunning = false;
+  }
+}
+
+function setAutosave(on, { persist = true } = {}) {
+  autosaveOn = !!on;
+  autosaveBtn.setAttribute('aria-checked', String(autosaveOn));
+  if (persist) { try { localStorage.setItem(AUTOSAVE_KEY, autosaveOn ? '1' : '0'); } catch {} }
+  if (autosaveOn) { lastAutosaveSig = null; setAutosaveStatus(''); autosaveTick(); }
+  else { clearDraft(); resetAutosaveSession(); setAutosaveStatus('Auto-save off'); }
+}
+autosaveBtn.addEventListener('click', () => setAutosave(!autosaveOn));
+try { if (localStorage.getItem(AUTOSAVE_KEY) === '0') setAutosave(false, { persist: false }); } catch {}
+
+setInterval(autosaveTick, AUTOSAVE_MS);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') autosaveTick(); });
+
+function timeAgo(ms) {
+  const s = Math.round((Date.now() - ms) / 1000);
+  if (s < 60) return 'just now';
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m} min ago`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `${h} hr ago`;
+  return new Date(ms).toLocaleDateString([], { month: 'short', day: 'numeric' });
+}
+
+async function showRestoreCard() {
+  const card = $('restoreCard');
+  let d = null;
+  try { d = await getDraft(); } catch {}
+  if (!d || !d.pageOrder || !d.pageOrder.length || !viewer.classList.contains('hidden')) { card.classList.add('hidden'); return; }
+  const n = d.pageOrder.length;
+  $('restoreSub').textContent = `${d.title} · ${n} page${n === 1 ? '' : 's'} · edited ${timeAgo(d.savedAt)}`;
+  $('restoreSub').title = d.title;
+  card.classList.remove('hidden');
+}
+
+async function restoreDraft() {
+  let d;
+  try { d = await getDraft(); } catch {}
+  if (!d) { $('restoreCard').classList.add('hidden'); return; }
+  const gen = ++loadGeneration;
+  $('restoreCard').classList.add('hidden');
+  zoomMode = 'width'; updateZoomUI();
+  setShapeTool(null); setTextMode(false);
+  lastResult = null;
+  showExportView('form');
+  uploader.classList.add('hidden');
+  viewer.classList.remove('hidden');
+  previewEl.innerHTML = '<div class="placeholder">Restoring your session…</div>';
+  try {
+    const entries = [];
+    for (let i = 0; i < d.docMeta.length; i++) {
+      const meta = d.docMeta[i];
+      const bytes = meta ? await idbTx('docs', 'readonly', s => s.docs.get(`${d.sessionId}:${i}`)) : null;
+      entries.push(bytes ? await loadDocFromBytes(bytes, meta.name, meta.size) : null);
+      if (isStale(gen)) return;
+    }
+    if (!entries[0]) throw new Error('the original file is missing from the draft');
+    for (const id of d.imageIds || []) {
+      const rec = await idbTx('docs', 'readonly', s => s.docs.get(`${d.sessionId}:img:${id}`));
+      if (rec) { try { await registerImage(rec.bytes, rec.mime, id); } catch {} }
+      if (isStale(gen)) return;
+    }
+    docs.length = 0;
+    docs.push(...entries);
+    thumbCache.clear();
+    pageOrder = d.pageOrder.filter(r => docs[r.doc]);
+    originalPageCount = d.originalPageCount;
+    savedStateJSON = d.savedStateJSON;
+    let maxId = 0;
+    pageOrder.forEach(r => (r.annotations || []).forEach(a => { if (a.id > maxId) maxId = a.id; }));
+    nextAnnId = Math.max(d.nextAnnId || 1, maxId + 1);
+    currentFile = new File([docs[0].bytes], d.fileName, { type: d.fileType || 'application/pdf' });
+    headerTitle.textContent = d.title;
+    headerTitle.title = d.title;
+    document.title = `${d.fileName} — PDF Smith`;
+    clearHistory();
+    for (let i = 0; i < docs.length; i++) {
+      if (!docs[i]) continue;
+      await renderDocThumbnails(i, gen);
+      if (isStale(gen)) return;
+    }
+    // Keep writing to the same draft; its documents are already stored.
+    autosaveSession = d.sessionId;
+    savedDocEntries = docs.slice();
+    savedImageIds = new Set((d.imageIds || []).filter(id => placedImages.has(id)));
+    lastAutosaveSig = autosaveSignature();
+    currentRef = pageOrder[0] || null;
+    applyRestoredState();
+    updateThumbActive();
+    setAutosaveStatus(autosaveOn ? 'Draft restored' : 'Auto-save off');
+  } catch (err) {
+    if (isStale(gen)) return;
+    previewEl.innerHTML = `<div class="placeholder err">Couldn't restore the session: ${escapeHtml(err.message || String(err))}</div>`;
+  }
+}
+
+$('restoreDraftBtn').addEventListener('click', restoreDraft);
+$('discardDraftBtn').addEventListener('click', async () => {
+  await clearDraft();
+  $('restoreCard').classList.add('hidden');
+});
+showRestoreCard();
+
+// ---- Export popover ------------------------------------------------------------
+const exportBtn = $('exportBtn');
+const exportBtnLabel = $('exportBtnLabel');
+const exportPanel = $('exportPanel');
+function exportOpen() { return !exportPanel.classList.contains('hidden'); }
+function openExport() {
+  if (exportOpen()) return;
+  closeInsertMenu();
+  finalizeActive();
+  exportPanel.classList.remove('hidden');
+  exportBtn.setAttribute('aria-expanded', 'true');
+}
+function closeExport() {
+  if (!exportOpen()) return;
+  exportPanel.classList.add('hidden');
+  exportBtn.setAttribute('aria-expanded', 'false');
+}
+function toggleExport() {
+  if (exportOpen()) closeExport();
+  else {
+    openExport();
+    const first = exportPanel.querySelector('.export-view:not(.hidden) input:checked, .export-view:not(.hidden) button');
+    if (first) first.focus();
+  }
+}
+exportBtn.addEventListener('click', (e) => { e.stopPropagation(); toggleExport(); });
+// Click outside closes it (it keeps working in the background).
+document.addEventListener('pointerdown', (e) => {
+  if (exportOpen() && !e.target.closest('.export-wrap')) closeExport();
+}, true);
+
+// ---- Collapsible side panels -------------------------------------------------
+const edBody = document.querySelector('.ed-body');
+const PANEL_KEY = 'pdfsmith.collapsed';
+const panelUi = {
+  pages:  { collapse: $('pagesCollapseBtn'),  expand: $('pagesExpandBtn'),  label: $('pagesRailLabel') },
+};
+
+function isCollapsed(name) { return edBody.classList.contains(`${name}-collapsed`); }
+
+function setPanelCollapsed(name, collapsed, { focus = false, persist = true } = {}) {
+  if (isCollapsed(name) === collapsed) return;
+  edBody.classList.toggle(`${name}-collapsed`, collapsed);
+  const ui = panelUi[name];
+  ui.collapse.setAttribute('aria-expanded', String(!collapsed));
+  ui.expand.setAttribute('aria-expanded', String(!collapsed));
+  if (focus) (collapsed ? ui.expand : ui.collapse).focus();
+  if (persist) {
+    try {
+      localStorage.setItem(PANEL_KEY, JSON.stringify({ pages: isCollapsed('pages') }));
+    } catch (_) { /* storage unavailable */ }
+  }
+  refitAfterPanelChange();
+}
+
+function togglePanel(name) {
+  if (window.matchMedia('(max-width: 940px)').matches) return;
+  setPanelCollapsed(name, !isCollapsed(name), { focus: document.activeElement !== document.body });
+}
+
+// Re-fit the preview once the grid column transition finishes.
+let panelRefitTimer;
+function refitAfterPanelChange() {
+  if (!currentRef) return;
+  clearTimeout(panelRefitTimer);
+  panelRefitTimer = setTimeout(() => buildContinuousPreview(currentRef), 230);
+}
+
+for (const name of Object.keys(panelUi)) {
+  const ui = panelUi[name];
+  ui.collapse.addEventListener('click', () => setPanelCollapsed(name, true, { focus: true }));
+  ui.expand.addEventListener('click', () => setPanelCollapsed(name, false, { focus: true }));
+  ui.label.addEventListener('click', () => setPanelCollapsed(name, false, { focus: true }));
+}
+
+try {
+  const saved = JSON.parse(localStorage.getItem(PANEL_KEY) || 'null');
+  if (saved) {
+    if (saved.pages) setPanelCollapsed('pages', true, { persist: false });
+  }
+} catch (_) { /* ignore bad or blocked storage */ }
+
 let resizeTimer;
 window.addEventListener('resize', () => {
   if (!currentRef) return;
@@ -1651,6 +2789,10 @@ function showExportView(which) {
   exportForm.classList.toggle('hidden', which !== 'form');
   exportWorking.classList.toggle('hidden', which !== 'working');
   result.classList.toggle('hidden', which !== 'result');
+  // Progress and results live in the export popover, so make sure it's open.
+  exportBtn.classList.toggle('is-busy', which === 'working');
+  exportBtnLabel.textContent = which === 'working' ? 'Exporting…' : 'Export';
+  if (which !== 'form' && !viewer.classList.contains('hidden')) openExport();
 }
 
 function showFormError(msg) {
@@ -2076,8 +3218,9 @@ async function buildReorganizedPdfBytes(order) {
   finalPages.forEach(p => newDoc.addPage(p));
 
   // Embed text annotations
-  if (order.some(r => r.annotations && r.annotations.some(a => a.text))) {
+  if (order.some(r => r.annotations && r.annotations.some(a => a.text || a.type === 'shape'))) {
     const fontCache = new Map();
+    const imgCache = new Map();
     const getFont = async (family, bold, italic) => {
       const key = `${family}_${bold}_${italic}`;
       if (!fontCache.has(key)) fontCache.set(key, await newDoc.embedFont(resolveStandardFont(family, bold, italic)));
@@ -2092,6 +3235,13 @@ async function buildReorganizedPdfBytes(order) {
       const W = box.width, H = box.height;
       const rot = ((pg.getRotation().angle % 360) + 360) % 360;
       for (const ann of anns) {
+        if (ann.type === 'shape') {
+          try {
+            if (ann.shape === 'image') await drawImageOnPdfPage(newDoc, pg, ann, box, rot, imgCache);
+            else drawShapeOnPdfPage(pg, ann, box, rot);
+          } catch (e) { console.warn('shape draw error', e); }
+          continue;
+        }
         if (ann.type !== 'text' || !ann.text) continue;
         try {
           const font  = await getFont(ann.fontFamily, ann.bold, ann.italic);
